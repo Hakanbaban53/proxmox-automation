@@ -1,0 +1,40 @@
+---
+# First contact with a freshly provisioned VM.
+# Phase 3 expands this into full agent roles
+# (Zabbix Agent 2, Trend Micro, ManageEngine, rsyslog -> QRadar).
+- name: First contact - verify a freshly provisioned VM
+  hosts: provisioned
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Show system identity
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is up -
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }},
+          kernel {{ ansible_facts['kernel'] }},
+          uptime {{ (ansible_facts['uptime_seconds'] / 60) | round(1) }} minutes
+
+    - name: Install QEMU guest agent (lets Proxmox see this VM's IP)
+      ansible.builtin.apt:
+        name: qemu-guest-agent
+        state: present
+        update_cache: true
+
+    - name: Enable and start the guest agent
+      ansible.builtin.service:
+        name: qemu-guest-agent
+        state: started
+        enabled: true
+
+    - name: Mark the VM as managed by this pipeline
+      ansible.builtin.copy:
+        content: |
+          provisioned-by: terraform + bpg/proxmox (proxmox-automation)
+          phase: 1
+          node: {{ ansible_facts['hostname'] }}
+        dest: /etc/provisioned-by
+        owner: root
+        group: root
+        mode: "0644"

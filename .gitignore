@@ -1,0 +1,27 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Secrets / keys
+*.pem
+id_rsa*
+id_ed25519*
+known_hosts*
+
+# Ansible
+*.retry
+__pycache__/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

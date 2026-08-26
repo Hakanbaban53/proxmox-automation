@@ -1,0 +1,40 @@
+# Copy to terraform.tfvars and adjust for your lab.
+#   cp terraform.tfvars.example terraform.tfvars
+# NEVER commit terraform.tfvars (see .gitignore).
+
+# --- Proxmox connection -----------------------------------------------------
+pve_endpoint  = "https://192.168.122.11:8006/"   # run `hostname -I` on pve-a
+pve_api_token = "terraform@pve!provider=00000000-0000-0000-0000-000000000000"
+pve_tls_insecure = true                          # false once you have real CA certs
+
+# --- Shared NFS storage ------------------------------------------------------
+storage_id = "nfs-shared"   # Datacenter > Storage > ID
+                        # content types needed: images, rootdir, vztmpl,
+                        # snippets, import
+
+# --- Template ----------------------------------------------------------------
+template_node = "pve-a"
+template_name = "ubuntu-2604-tpl"
+template_vmid = 9000
+# Baseline image (no x86-64-v3 CPU requirement):
+# cloud_image_url = "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+cpu_type = "x86-64-v3"   # use "host" for nested-virt homelabs
+
+# --- Workload VM --------------------------------------------------------------
+vm_node       = "pve-a"
+vm_name       = "vm-test-01"
+workload_vmid = 200
+vm_cpu_cores  = 2
+vm_memory_mb  = 2048
+vm_disk_size_gb = 10
+vm_bridge     = "vmbr0"
+vlan_tag      = 0              # maps to network_device.vlan_id; set 10-4094 on trunk ports in production
+
+vm_ip_address = "192.168.122.50"
+vm_ip_cidr    = 24
+vm_ip_gateway = "192.168.122.1"
+dns_servers   = ["192.168.122.1", "1.1.1.1"]
+search_domain = "lab.local"
+
+vm_username         = "ubuntu"
+ssh_public_key_path = "~/.ssh/id_ed25519.pub"
