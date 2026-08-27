@@ -1,0 +1,13 @@
+---
+# Ansible collections required by this pipeline.
+# Install on the control node (ctrl-01) with:
+#   ansible-galaxy collection install -r requirements.yml
+#
+# Phase 1 used built-in modules only; Phase 2's LVM/XFS work needs
+# community.general (lvg, lvol, filesystem) and ansible.posix (mount).
+
+collections:
+  - name: community.general
+    source: https://galaxy.ansible.com
+  - name: ansible.posix
+    source: https://galaxy.ansible.com

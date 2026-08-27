@@ -27,6 +27,28 @@ workload_vmid = 200
 vm_cpu_cores  = 2
 vm_memory_mb  = 2048
 vm_disk_size_gb = 10
+
+# --- Phase 2: data disks (one per mount point; grow = edit + apply) ----------
+var_disk_size_gb    = 10   # scsi1 serial=var01    -> /srv/var
+log_disk_size_gb    = 10   # scsi2 serial=log01    -> /srv/log
+data_disk_size_gb   = 20   # scsi3 serial=data01   -> /srv/data  (resize demo)
+backup_disk_size_gb = 15   # scsi4 serial=backup01 -> /srv/backup
+
+# --- Phase 2 addendum: optional fifth disk (growth workflow) -----------------
+# 0 = no scratch disk (no scsi5 block at all). To try the growth workflow:
+# set a size, apply, add the scratch01 entry to
+# ansible/inventory/group_vars/provisioned.yml, run 02_storage.yml.
+# If the playbook cannot find serial scratch01 after the apply, fully
+# stop/start the VM on the PVE node (qm shutdown 200 && qm start 200) -
+# a NEW disk's serial MAY reach the guest only at the next full VM start
+# (field run 1: it appeared immediately, no restart needed), while
+# resizing EXISTING disks stays fully online.
+# NOTE: an apply may also re-download the cloud image (~5 min, plan shows
+# "1 to destroy" on proxmox_download_file) when upstream re-publishes it;
+# the VM itself is updated in-place. Pin it with overwrite=false if you
+# prefer reproducibility.
+scratch_disk_size_gb = 0
+
 vm_bridge     = "vmbr0"
 vlan_tag      = 0              # maps to network_device.vlan_id; set 10-4094 on trunk ports in production
 

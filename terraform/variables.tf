@@ -127,6 +127,55 @@ variable "vm_disk_size_gb" {
   default     = 10
 }
 
+# ---------------------------------------------------------------------------
+# Phase 2 data disks (one per mount point, DB-server practice).
+# Sizes are workload parameters: grow them in tfvars, apply, then re-run
+# the Ansible storage playbook - the PV/LV/XFS chain extends online.
+# Shrinking is not supported (provider hard error + XFS limitation).
+# ---------------------------------------------------------------------------
+
+variable "var_disk_size_gb" {
+  description = "Size (GB) of the /var data disk (serial: var01)."
+  type        = number
+  default     = 10
+}
+
+variable "log_disk_size_gb" {
+  description = "Size (GB) of the log data disk (serial: log01)."
+  type        = number
+  default     = 10
+}
+
+variable "data_disk_size_gb" {
+  description = "Size (GB) of the data disk (serial: data01). This is the resize-demo disk."
+  type        = number
+  default     = 20
+}
+
+variable "backup_disk_size_gb" {
+  description = "Size (GB) of the backup data disk (serial: backup01)."
+  type        = number
+  default     = 15
+}
+
+variable "scratch_disk_size_gb" {
+  description = <<-EOT
+    Optional fifth data disk (serial: scratch01 -> /srv/scratch), GB.
+    0 = disabled: no scsi5 disk block is created at all (dynamic block
+    with an empty for_each). Set a size, apply, then add the scratch01
+    entry to ansible/inventory/group_vars/provisioned.yml and re-run
+    playbooks/02_storage.yml - the mount is an Ansible-side concern.
+    NOTE: a NEWLY attached disk's serial reaches the guest kernel only
+    at the next FULL VM start; if the playbook reports scratch01 NOT
+    FOUND right after the apply, run on the PVE node:
+    qm shutdown <vmid> && qm start <vmid>. Growing EXISTING disks
+    (like data_disk_size_gb 20 -> 30) stays fully online - that is the
+    field difference between resizing a disk and attaching a new one.
+  EOT
+  type    = number
+  default = 0
+}
+
 variable "vm_bridge" {
   description = "Linux bridge for the VM NIC (e.g. vmbr0)."
   type        = string

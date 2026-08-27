@@ -1,0 +1,309 @@
+---
+# Phase 2 verification: does the storage stack survive a REBOOT?
+#
+# 02_storage.yml converges disks into mounted XFS filesystems, and the
+# Phase 2 guide proved that chain in the field. But one property stayed
+# untested the whole time: BOOT PERSISTENCE. fstab lines and LVM
+# auto-activation only prove themselves when the machine actually boots
+# with them. "Should survive a reboot" and "verified to survive a reboot"
+# are different claims, and the gap between them is where production
+# incidents live: a typo'd fstab entry, a VG the boot sequence fails to
+# activate, a mount that only worked because a human ran mount -a by hand.
+#
+# This playbook closes the gap by doing the thing a cautious engineer
+# would do by hand, but repeatably:
+#   1. Mints a one-run token and writes a marker file into EVERY data
+#      filesystem (if the content matches after the reboot, the data
+#      really persisted - not just a directory with the same name).
+#   2. Records the serial -> device mapping BEFORE the reboot.
+#   3. Reboots the VM via the reboot module (waits for SSH to return).
+#   4. Re-reads everything AFTER the reboot: markers byte-for-byte, every
+#      mount actually mounted (from fresh facts, not cached ones), every
+#      LV active, fstab lines present, findmnt source = the expected
+#      /dev/mapper path, serial -> device mapping resolved again from the
+#      kernel view.
+#
+# Expect a reboot on every run - that is the product. For a quick check
+# without the downtime:
+#   ansible-playbook playbooks/03_storage_verify.yml -e verify_reboot=false
+# (with verify_reboot=false the marker check becomes a same-session smoke
+# test; the mount/LV/fstab checks remain meaningful.)
+#
+# The disk list comes from group_vars/provisioned.yml, the same single
+# source of truth 02_storage.yml reads - one list, two playbooks.
+#
+# Edition 1.1: the first field run (ctrl-01 / vm-test-01) was green
+# through the reboot - markers byte-for-byte, every mount up from a fresh
+# boot, LVM report intact - but the LV-active check false-failed on all
+# four volumes: /dev/<vg>/<lv> is a udev symlink to /dev/dm-X and the
+# stat module does not follow symlinks unless follow: true is set, so it
+# reported islnk instead of isblk. Fixed below. The addendum guide's
+# transcripts stay "expected shape" until the next green run replaces
+# them (same convention the Phase 2 guide used before edition 2).
+- name: Verify the storage stack across a reboot
+  hosts: provisioned
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Require the storage layout (group_vars/provisioned.yml)
+      ansible.builtin.assert:
+        that: data_disks is defined and data_disks | length > 0
+        fail_msg: >-
+          data_disks is not defined. The storage layout lives in
+          ansible/inventory/group_vars/provisioned.yml; check that the file
+          exists and that the play is running against the `provisioned`
+          group with the repository's ansible.cfg.
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Before the reboot: markers + mapping snapshot.
+    # ------------------------------------------------------------------
+    - name: Mint a one-run verification token
+      ansible.builtin.set_fact:
+        verify_token: "phase2-{{ ansible_facts.date_time.epoch }}-{{ 100000 | random }}"
+
+    - name: Write a marker file into every data filesystem
+      ansible.builtin.copy:
+        content: "{{ item.mount }} {{ verify_token }}"
+        dest: "{{ item.mount }}/phase2-verify.txt"
+        mode: "0644"
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.mount }}/phase2-verify.txt"
+
+    - name: Record the serial to device mapping BEFORE the reboot
+      ansible.builtin.command:
+        cmd: lsblk -J -o NAME,TYPE,SERIAL
+      register: lsblk_before
+      changed_when: false
+
+    - name: Snapshot the mapping (kernel view, same source as 02_storage)
+      ansible.builtin.set_fact:
+        serial_before: >-
+          {{ serial_before | default({}) | combine({
+               item: (lsblk_before.stdout | from_json).blockdevices
+                     | selectattr('type', 'equalto', 'disk')
+                     | selectattr('serial', 'equalto', item)
+                     | map(attribute='name') | list
+             }) }}
+      loop: "{{ data_disks | map(attribute='serial') | list }}"
+
+    - name: Show the mapping before the reboot
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.serial }} = /dev/{{ serial_before[item.serial][0]
+               if serial_before[item.serial] | default([]) | length == 1
+               else 'NOT FOUND (run 02_storage.yml first)' }}
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    # ------------------------------------------------------------------
+    # The reboot itself.
+    # ------------------------------------------------------------------
+    - name: Reboot the VM (the moment of truth for fstab and LVM activation)
+      ansible.builtin.reboot:
+        msg: "Phase 2 verification reboot: proving fstab + LVM boot persistence"
+        pre_reboot_delay: 5
+        post_reboot_delay: 10
+        reboot_timeout: 600
+        test_command: "uptime"
+      when: verify_reboot | default(true) | bool
+
+    - name: Show the fresh boot time
+      ansible.builtin.command: uptime -s
+      register: boot_time
+      changed_when: false
+      when: verify_reboot | default(true) | bool
+
+    - name: Refresh facts after the reboot (pre-reboot facts are stale)
+      ansible.builtin.setup:
+      when: verify_reboot | default(true) | bool
+
+    # ------------------------------------------------------------------
+    # After the reboot: prove everything came back on its own.
+    # ------------------------------------------------------------------
+    - name: Read the marker files back
+      ansible.builtin.slurp:
+        src: "{{ item.mount }}/phase2-verify.txt"
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.mount }}/phase2-verify.txt"
+      register: marker_read
+
+    - name: Marker contents must match byte for byte (data really persisted)
+      ansible.builtin.assert:
+        that: marker_read.results[idx].content | b64decode == item.mount ~ ' ' ~ verify_token
+        fail_msg: >-
+          Marker mismatch on {{ item.mount }}: expected
+          "{{ item.mount }} {{ verify_token }}", got
+          "{{ marker_read.results[idx].content | b64decode }}". The
+          filesystem mounted on {{ item.mount }} did not preserve the data
+          written before the reboot - check lsblk SERIAL vs fstab, the
+          mount may be a fresh/empty filesystem rather than the expected
+          /dev/{{ item.vg }}/{{ item.lv }}.
+      loop: "{{ data_disks }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.mount }}"
+
+    - name: Every data filesystem must be mounted after the reboot
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.mounts | selectattr('mount', 'equalto', item.mount) | list | length == 1
+          - (ansible_facts.mounts | selectattr('mount', 'equalto', item.mount) | map(attribute='fstype') | list) == ['xfs']
+        fail_msg: >-
+          {{ item.mount }} is not a mounted XFS filesystem after the
+          reboot. Boot-time mounting failed: check `systemctl status
+          local-fs.target` and the fstab line for {{ item.mount }} in the
+          guest.
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    - name: Read the LVM logical volume report (JSON)
+      ansible.builtin.command:
+        cmd: lvs --reportformat json --noheadings -o vg_name,lv_name,lv_attr
+      register: lvs_state
+      changed_when: false
+
+    - name: Parse the LVM report
+      ansible.builtin.set_fact:
+        lv_rows: "{{ (lvs_state.stdout | from_json).report[0].lv }}"
+
+    - name: Exactly the expected logical volumes must exist
+      ansible.builtin.assert:
+        that: lv_rows | length == data_disks | length
+        fail_msg: >-
+          Expected exactly {{ data_disks | length }} logical volumes, found
+          {{ lv_rows | length }}: {{ lv_rows | map(attribute='vg_name')
+          | join(', ') }}. Run 02_storage.yml to converge the stack, then
+          re-run this playbook.
+
+    - name: Every expected logical volume must be in the report
+      ansible.builtin.assert:
+        that: lv_rows | selectattr('vg_name', 'equalto', item.vg) | selectattr('lv_name', 'equalto', item.lv) | list | length == 1
+        fail_msg: >-
+          {{ item.vg }}/{{ item.lv }} is missing from the LVM report. Run
+          02_storage.yml to build the stack, then re-run this playbook.
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.vg }}/{{ item.lv }}"
+
+    # An ACTIVE logical volume exposes its device node; an inactive one
+    # has none at all. But /dev/<vg>/<lv> is a udev-managed SYMLINK to
+    # /dev/dm-X, and the stat module does NOT follow symlinks by default:
+    # without follow it stats the link itself and reports islnk, never
+    # isblk - a false "volume group was not activated" on every run.
+    # Found the honest way in the first field run. follow: true resolves
+    # the link to the dm node, where isblk is honest - and no lv_attr
+    # position parsing is needed either.
+    - name: Check every logical volume's device node
+      ansible.builtin.stat:
+        path: "/dev/{{ item.vg }}/{{ item.lv }}"
+        follow: true
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "/dev/{{ item.vg }}/{{ item.lv }}"
+      register: lv_nodes
+
+    - name: Every logical volume must be active after the reboot
+      ansible.builtin.assert:
+        that:
+          - lv_nodes.results[idx].stat.exists
+          - lv_nodes.results[idx].stat.isblk
+        fail_msg: >-
+          /dev/{{ item.vg }}/{{ item.lv }} does not resolve to a block
+          device after the reboot (stat follows the /dev/dm-X symlink):
+          the volume group was not activated at boot. Check `systemctl
+          status lvm2-activation.service` (or the systemd generator) and
+          `vgchange -ay` in the guest.
+      loop: "{{ data_disks }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.vg }}/{{ item.lv }}"
+
+    - name: Record the serial to device mapping AFTER the reboot
+      ansible.builtin.command:
+        cmd: lsblk -J -o NAME,TYPE,SERIAL
+      register: lsblk_after
+      changed_when: false
+
+    - name: Snapshot the mapping after the reboot
+      ansible.builtin.set_fact:
+        serial_after: >-
+          {{ serial_after | default({}) | combine({
+               item: (lsblk_after.stdout | from_json).blockdevices
+                     | selectattr('type', 'equalto', 'disk')
+                     | selectattr('serial', 'equalto', item)
+                     | map(attribute='name') | list
+             }) }}
+      loop: "{{ data_disks | map(attribute='serial') | list }}"
+
+    - name: Every serial must still resolve to exactly one disk (identity survived the boot)
+      ansible.builtin.assert:
+        that: serial_after[item.serial] | default([]) | length == 1
+        fail_msg: >-
+          Expected exactly one disk with serial {{ item.serial }} after
+          the reboot, found {{ serial_after[item.serial] | default([])
+          | length }}. The serial is the disk's identity; if the kernel
+          stopped reporting it, check `qm config <vmid> | grep serial` on
+          the PVE node and `lsblk -o NAME,SIZE,SERIAL` in the guest.
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    - name: Show the mapping before vs after (letters may shuffle, serials do not)
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.serial }}: /dev/{{ serial_before[item.serial] | default(['?']) | first }}
+          before -> /dev/{{ serial_after[item.serial] | default(['?']) | first }}
+          after ({{ item.vg }}/{{ item.lv }} on {{ item.mount }})
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    - name: Read the fstab line for every mount (persistence receipt)
+      # ansible.posix.mount writes src verbatim: /dev/<vg>/<lv> (not the
+      # /dev/mapper/ alias). The grep matches device AND mount point.
+      ansible.builtin.command:
+        cmd: "grep -E '^/dev/{{ item.vg }}/{{ item.lv }}[[:space:]]+{{ item.mount }}[[:space:]]' /etc/fstab"
+      register: fstab_lines
+      changed_when: false
+      failed_when: false
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    - name: Every mount must have its fstab line
+      ansible.builtin.assert:
+        that: fstab_lines.results[idx].rc == 0
+        fail_msg: >-
+          No fstab line found for /dev/{{ item.vg }}/{{ item.lv }} (mount
+          {{ item.mount }}). The mount worked only because 02_storage.yml
+          ran mount by hand - it would NOT come back after a reboot. Check
+          /etc/fstab in the guest.
+      loop: "{{ data_disks }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.mount }}"
+
+    # ------------------------------------------------------------------
+    # Receipts for the log file.
+    # ------------------------------------------------------------------
+    - name: Show the boot-time mount status of every data filesystem
+      ansible.builtin.command:
+        cmd: "findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS {{ item.mount }}"
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.mount }}"
+      changed_when: false
+
+    - name: Show block devices with serials and mounts
+      ansible.builtin.command: lsblk -o NAME,SIZE,TYPE,SERIAL,MOUNTPOINT
+      changed_when: false
+
+    - name: Show filesystem usage
+      ansible.builtin.command: "df -h {{ data_disks | map(attribute='mount') | join(' ') }}"
+      changed_when: false

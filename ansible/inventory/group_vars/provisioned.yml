@@ -1,0 +1,45 @@
+---
+# Single source of truth for the Phase 2 storage layout.
+#
+# Read by playbooks/02_storage.yml (build the stack) and
+# playbooks/03_storage_verify.yml (prove it survives a reboot). Keeping the
+# list HERE means the build playbook and the verify playbook can never drift
+# apart: they resolve the same serials, expect the same VG/LV names and check
+# the same mount points, from one file.
+#
+# The serial values must match the disk blocks in terraform/vm.tf exactly.
+# The serial is the join key between the two sides: Terraform decides which
+# disks EXIST (and their sizes, in tfvars); this file decides what each disk
+# BECOMES inside the guest (VG, LV, mount point). Device letters are never
+# listed here or anywhere else - both playbooks resolve serial -> device
+# fresh from the kernel view on every run.
+#
+# Enable the optional scratch disk (terraform: scratch_disk_size_gb > 0)?
+# Append its entry, then run 02_storage.yml:
+#   - serial: scratch01
+#     vg: vg_scratch
+#     lv: lv_scratch
+#     mount: /srv/scratch
+data_disks:
+  - serial: var01        # scsi1, size: var_disk_size_gb
+    vg: vg_var
+    lv: lv_var
+    mount: /srv/var
+  - serial: log01        # scsi2, size: log_disk_size_gb
+    vg: vg_log
+    lv: lv_log
+    mount: /srv/log
+  - serial: data01       # scsi3, size: data_disk_size_gb
+    vg: vg_data
+    lv: lv_data
+    mount: /srv/data
+  - serial: backup01     # scsi4, size: backup_disk_size_gb
+    vg: vg_backup
+    lv: lv_backup
+    mount: /srv/backup
+
+# 03_storage_verify.yml reboots the VM by default (that is the point: fstab
+# entries and LVM activation only prove themselves at boot). Quick check
+# without the downtime:
+#   ansible-playbook playbooks/03_storage_verify.yml -e verify_reboot=false
+verify_reboot: true

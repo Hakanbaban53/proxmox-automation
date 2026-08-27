@@ -1,0 +1,194 @@
+---
+# Phase 2 storage: serial-tagged disks -> PV -> VG -> LV -> XFS -> fstab.
+#
+# v3 (addendum): the data_disks list moved from this file's `vars:` to
+# group_vars/provisioned.yml, the single source of truth shared with
+# 03_storage_verify.yml. Two playbooks, one list: the build side and the
+# verify side can no longer drift apart. Override for experiments with
+# -e / --extra-vars, which always beats group_vars. The TASKS below are
+# unchanged from the field-verified v2 - only where the list lives moved.
+#
+# The problem this replaces (from the field): on DB servers with 4-5 extra
+# disks, /dev/sdb /dev/sdc ... letters do NOT map 1:1 to hypervisor disks,
+# so engineers resized disks by trial and error to find out which was
+# which. Here every disk carries a `serial` set in Terraform (vm.tf), and
+# this playbook resolves serial -> device FRESH on every run.
+#
+# Source of truth for that resolution: the KERNEL view, via
+# `lsblk -J -o NAME,TYPE,SERIAL`. Field finding from the first Phase 2
+# run (Ubuntu 26.04 guest, virtio-scsi): the kernel reports the serials
+# correctly (lsblk SERIAL column, and `qm showcmd` shows serial=... on
+# every data device), but the guest never materialized
+# /dev/disk/by-id/*-<serial> symlinks - so v1 of this playbook, which
+# looked only in by-id, found nothing. v2 reads the kernel view instead
+# and works with or without by-id. Transient /dev/sdX names are safe
+# here because nothing persists them: LVM tracks PVs by UUID and fstab
+# references /dev/<vg>/<lv>.
+#
+# Idempotent AND resize-aware: after `terraform apply` grows a disk,
+# re-running this playbook completes the whole chain automatically -
+# pvresize -> lvextend --resizefs -> xfs_growfs. No fdisk, no growpart,
+# no multi-terminal command juggling, no reboot.
+#
+# Mount points: the lab uses /srv/<name> roots. Production DB servers
+# mount /var /log /data /backup instead; mounting a fresh filesystem over
+# a LIVE /var requires migrating existing content first (rsync dance) -
+# deliberately out of scope here, see README "Phase 2" notes.
+- name: Storage - LVM and XFS on serial-tagged data disks
+  hosts: provisioned
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Require the storage layout (group_vars/provisioned.yml)
+      ansible.builtin.assert:
+        that: data_disks is defined and data_disks | length > 0
+        fail_msg: >-
+          data_disks is not defined. The storage layout lives in
+          ansible/inventory/group_vars/provisioned.yml; check that the file
+          exists and that the play is running against the `provisioned`
+          group with the repository's ansible.cfg.
+
+    - name: Install LVM and XFS tooling (Ubuntu cloud images ship without them)
+      ansible.builtin.apt:
+        name:
+          - lvm2
+          - xfsprogs
+        state: present
+        update_cache: true
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Resolve each serial to its block device, straight from the kernel.
+    # ------------------------------------------------------------------
+    - name: Read the kernel serial view of all disks
+      ansible.builtin.command:
+        cmd: lsblk -J -o NAME,TYPE,SERIAL
+      register: lsblk_serials
+      changed_when: false
+
+    - name: Map every serial to its disk(s) (kernel view)
+      ansible.builtin.set_fact:
+        serial_map: >-
+          {{ serial_map | default({}) | combine({
+               item: (lsblk_serials.stdout | from_json).blockdevices
+                     | selectattr('type', 'equalto', 'disk')
+                     | selectattr('serial', 'equalto', item)
+                     | map(attribute='name') | list
+             }) }}
+      loop: "{{ data_disks | map(attribute='serial') | list }}"
+
+    - name: Show the serial to device mapping (the guessing game this replaces)
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.serial }} ({{ item.vg }}/{{ item.lv }} -> {{ item.mount }})
+          = {{ '/dev/' ~ serial_map[item.serial][0]
+               if serial_map[item.serial] | default([]) | length == 1
+               else 'NOT FOUND' }}
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    - name: Every serial must resolve to exactly one disk
+      ansible.builtin.assert:
+        that: serial_map[item.serial] | default([]) | length == 1
+        fail_msg: >-
+          Expected exactly one disk with serial {{ item.serial }}, found
+          {{ serial_map[item.serial] | default([]) | length }}. Diagnose
+          in the guest with: lsblk -o NAME,SIZE,SERIAL.
+          (a) If the data disks show EMPTY serials there, the running
+          QEMU predates the serial reaching the VM config: on the PVE
+          node check `qm config <vmid> | grep serial`, and if the config
+          is right, fully stop and start the VM
+          (qm shutdown <vmid> && qm start <vmid>) - a guest-OS reboot
+          does NOT restart the QEMU process.
+          (b) If lsblk does show the serial, compare the serial values
+          against the disk blocks in vm.tf - the playbook reads exactly
+          what the kernel reports.
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    - name: Build the serial to device map used below
+      ansible.builtin.set_fact:
+        disk_map: >-
+          {{ disk_map | default({}) | combine({
+               item.serial: '/dev/' ~ serial_map[item.serial][0]
+             }) }}
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    # ------------------------------------------------------------------
+    # Resize chain, step by step. Every task below is a no-op on a
+    # re-run where nothing grew (idempotence), and does exactly one
+    # thing when something did.
+    # ------------------------------------------------------------------
+
+    # Step 1: PV create (first run) + pvresize (after hypervisor growth).
+    # fstype: lvm + resizefs: true is community.general's way of saying
+    # "pvcreate it, then pvresize it on every run".
+    - name: Create/resize physical volumes
+      community.general.filesystem:
+        fstype: lvm
+        dev: "{{ disk_map[item.serial] }}"
+        resizefs: true
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.serial }}"
+
+    # Step 2: VG create (first run); no-op afterwards (PV already in VG).
+    - name: Create volume groups (one per disk)
+      community.general.lvg:
+        vg: "{{ item.vg }}"
+        pvs: "{{ disk_map[item.serial] }}"
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.vg }}"
+
+    # Step 3: LV create (first run); lvextend --resizefs (after growth).
+    # size: 100%VG means "the LV always equals its VG" - which is one
+    # disk here. lvol grows the LV when the VG grew and runs
+    # lvextend --resizefs, which for XFS calls xfs_growfs online.
+    - name: Create/extend logical volumes at 100 percent of their VG
+      community.general.lvol:
+        vg: "{{ item.vg }}"
+        lv: "{{ item.lv }}"
+        size: 100%VG
+        resizefs: true
+        shrink: false
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.vg }}/{{ item.lv }}"
+
+    # Step 4: XFS create (first run only; module detects existing fs).
+    - name: Create XFS filesystems
+      community.general.filesystem:
+        fstype: xfs
+        dev: "/dev/{{ item.vg }}/{{ item.lv }}"
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "/dev/{{ item.vg }}/{{ item.lv }}"
+
+    # Step 5: mount now + persist across reboots (fstab).
+    - name: Mount filesystems and persist in fstab
+      ansible.posix.mount:
+        path: "{{ item.mount }}"
+        src: "/dev/{{ item.vg }}/{{ item.lv }}"
+        fstype: xfs
+        opts: defaults,noatime
+        state: mounted
+      loop: "{{ data_disks }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    # ------------------------------------------------------------------
+    # Receipts for the log file.
+    # ------------------------------------------------------------------
+    - name: Show block devices with serials and mounts
+      ansible.builtin.command: lsblk -o NAME,SIZE,TYPE,SERIAL,MOUNTPOINT
+      changed_when: false
+
+    - name: Show filesystem usage
+      ansible.builtin.command: "df -h {{ data_disks | map(attribute='mount') | join(' ') }}"
+      changed_when: false
