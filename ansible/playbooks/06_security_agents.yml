@@ -1,0 +1,138 @@
+---
+# Phase 3, part 3: security agents (Trend Micro, ManageEngine) via the
+# stub installer pattern.
+#
+# The licensed security tools (Trend Micro Deep Security, ManageEngine)
+# cannot run in this lab: no installer binaries, no licenses, no
+# call-home infrastructure. But the PIPELINE that will deploy them can
+# run today, and that is what this playbook builds. The original plan
+# said it plainly: stub shell scripts, echo instead of install, a
+# marker file to prove it happened - end-to-end testable now, real
+# installers swapped in the day the licenses arrive.
+#
+# The pattern is an ABSTRACTION BOUNDARY, and it has exactly one rule:
+# the marker contract. Every installer, stub or licensed, must end by
+# writing <install_dir>/.installed containing:
+#     agent=<name>
+#     version=<version>
+#     mode=<stub|real>
+#     installed_at=<iso date>
+#     host=<short hostname>
+# Everything else is replaceable. The playbook only ever talks to that
+# contract:
+#   - deploys an installer script into the agent's /opt directory
+#   - runs it once (the creates: guard makes re-runs a no-op)
+#   - reads the marker back and asserts agent/version/mode match
+# The stub's installer block is three echo lines with a loud banner
+# saying where the real one goes; the marker block is production code
+# and does not change when the payload does.
+#
+# Idempotency arithmetic (guide chapter 5 has the expected shapes):
+#   first run  - dirs + scripts + installer runs   -> changed=3
+#   re-run     - installer skipped by the marker   -> changed=0
+#   version
+#   bumped     - marker assert FAILS by design: a new desired version
+#                 with an old marker is drift, and drift should be loud.
+#                 Documented force-reinstall: remove the marker file.
+# mode: real is reserved for licensed installers and intentionally
+# fails the guard until one is actually wired in - pretending to
+# install real security tooling would be the one dishonest move this
+# series refuses to make.
+- name: Security agents - stub installers with a marker contract
+  hosts: provisioned
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Require the agent list and validate the marker contract inputs
+      ansible.builtin.assert:
+        that:
+          - security_agents is defined and security_agents | length > 0
+          - security_agents | map(attribute='name') | list | length
+             == security_agents | map(attribute='name') | unique | list | length
+          - security_agents | selectattr('mode', 'equalto', 'stub') | list | length
+             == security_agents | length
+          - security_agents | map(attribute='install_dir') | select('match', '^/') | list | length
+             == security_agents | length
+        fail_msg: >-
+          security_agents is missing or invalid. It lives in
+          ansible/inventory/group_vars/provisioned.yml (Phase 3
+          section). Every entry needs name, display_name, mode,
+          version and an ABSOLUTE install_dir; names must be unique;
+          and mode must be 'stub' - 'real' is reserved for licensed
+          installers that are not wired in yet (the guide's chapter 4
+          has the swap-in runbook).
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Deploy the harness: one directory and one installer script per
+    # agent. The script is a template so the stub banner, the version
+    # and the marker block all come from the same source of truth.
+    # ------------------------------------------------------------------
+    - name: Create the agent install directories
+      ansible.builtin.file:
+        path: "{{ item.install_dir }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ security_agents }}"
+      loop_control:
+        label: "{{ item.install_dir }}"
+
+    - name: Deploy the installer scripts
+      ansible.builtin.template:
+        src: templates/install.sh.j2
+        dest: "{{ item.install_dir }}/install.sh"
+        mode: "0755"
+      loop: "{{ security_agents }}"
+      loop_control:
+        label: "{{ item.install_dir }}/install.sh"
+
+    - name: Run each installer once (the marker is the creates-guard)
+      ansible.builtin.command:
+        cmd: "{{ item.install_dir }}/install.sh"
+        creates: "{{ item.install_dir }}/.installed"
+      loop: "{{ security_agents }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ------------------------------------------------------------------
+    # Verify against the marker contract, not against the stub's
+    # echoes: whatever runs later (licensed installer included) only
+    # has to keep the marker honest for this playbook to pass.
+    # ------------------------------------------------------------------
+    - name: Read every marker file back
+      ansible.builtin.slurp:
+        src: "{{ item.install_dir }}/.installed"
+      loop: "{{ security_agents }}"
+      loop_control:
+        label: "{{ item.install_dir }}/.installed"
+      register: marker_blobs
+
+    - name: Markers must record agent, version and mode
+      ansible.builtin.assert:
+        that:
+          - "'agent=' ~ item.name in marker_blobs.results[ansible_loop.index0].content | b64decode"
+          - "'version=' ~ item.version in marker_blobs.results[ansible_loop.index0].content | b64decode"
+          - "'mode=' ~ item.mode in marker_blobs.results[ansible_loop.index0].content | b64decode"
+        fail_msg: >-
+          Marker mismatch for {{ item.name }}: expected agent/version
+          {{ item.version }}/mode {{ item.mode }}. If you just bumped
+          the version in group_vars, this failure is the drift alarm
+          doing its job - force a reinstall with:
+          ansible provisioned -m file -a "path={{ item.install_dir }}/.installed state=absent" -b
+          then re-run this playbook.
+      loop: "{{ security_agents }}"
+      loop_control:
+        extended: true
+        label: "{{ item.name }}"
+
+    - name: Receipt - agents on record
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }} ({{ item.display_name }}) marker at
+          {{ item.install_dir }}/.installed records version
+          {{ marker_blobs.results[ansible_loop.index0].content | b64decode | regex_findall('version=.*') | join(', ') }}
+      loop: "{{ security_agents }}"
+      loop_control:
+        extended: true
+        label: "{{ item.name }}"

@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+# Phase 3 (04_zabbix_agent.yml). Deliberately close to the packaged
+# default: only the lines a server-side host entry cares about are
+# variable. TLS and HostInterface belong to the production-hardening
+# pass, not the lab.
+PidFile=/run/zabbix/zabbix_agent2.pid
+LogFile=/var/log/zabbix/zabbix_agent2.log
+Server={{ zabbix_agent_server }}
+ListenPort={{ zabbix_agent_listenport }}
+ServerActive={{ zabbix_agent_serveractive }}
+Hostname={{ zabbix_agent_hostname }}
+Include=/etc/zabbix/zabbix_agent2.d/plugins.d/*.conf

@@ -1,0 +1,35 @@
+#!/bin/sh
+# {{ item.display_name }} - installer ({{ item.mode }} mode).
+# Deployed by 06_security_agents.yml; Ansible-managed.
+#
+# THE MARKER CONTRACT (the only stable interface): whatever this script
+# is, it ends by writing {{ item.install_dir }}/.installed recording
+# agent, version, mode, timestamp and host. The playbook runs this
+# script once (creates-guard on the marker), then asserts the marker
+# back. Swap the installer block for the licensed one and keep the
+# marker block byte-for-byte - the playbook never notices.
+set -eu
+
+INSTALL_DIR="{{ item.install_dir }}"
+MARKER="{{ item.install_dir }}/.installed"
+
+echo "[{{ item.name }}] installer starting: version {{ item.version }}, mode {{ item.mode }}"
+
+# ---- installer block ------------------------------------------------
+# STUB: simulates the licensed installer. When the real binary and
+# license arrive, replace ONLY this block (download, silent install
+# flags, service start) and leave the marker block untouched.
+echo "[{{ item.name }}] stub payload: no binaries deployed, no license used"
+# ---- end installer block ---------------------------------------------
+
+mkdir -p "$INSTALL_DIR"
+{
+  echo "agent={{ item.name }}"
+  echo "version={{ item.version }}"
+  echo "mode={{ item.mode }}"
+  echo "installed_at=$(date -Is)"
+  echo "host=$(hostname -s)"
+} > "$MARKER"
+
+echo "[{{ item.name }}] marker written: $MARKER"
+echo "[{{ item.name }}] installer finished"

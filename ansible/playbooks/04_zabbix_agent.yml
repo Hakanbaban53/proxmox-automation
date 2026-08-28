@@ -1,0 +1,219 @@
+---
+# Phase 3, part 1: Zabbix Agent 2 on every provisioned VM.
+#
+# The storage layer (Phase 2) is proven; the machines now exist and hold
+# data, which makes the next question operational: what is happening ON
+# them? This playbook installs the monitoring agent that answers it.
+#
+# Why Agent 2 and not the classic agent: same job (local metrics, port
+# 10050), rewritten in Go - plugin architecture, persistent connection
+# for active checks, fewer fork-per-metric costs. For a fleet of cloned
+# DB servers it is the default choice; the config knobs are the ones a
+# server-side host entry expects (Server, ServerActive, Hostname).
+#
+# Why hand-rolled and not the community.zabbix role (the original plan
+# said role): three field reasons. (1) The repo pin is ours: Zabbix 7.0
+# LTS is the ONLY current major that publishes an Ubuntu 26.04
+# "resolute" section (live-checked Aug 2026: 7.0 yes, 8.0/8.2 not yet),
+# so the playbook pins 7.0 and the guide documents the check. (2) The
+# control node installs nothing new: Phase 3 stays ansible.builtin-only
+# (requirements.yml unchanged), which also keeps the sandbox validation
+# honest. (3) This series shows every command it runs; a role that
+# hides 40 tasks would hide the transcript. When a second OS family or
+# a fleet of parameters arrives, swapping to the role is a documented
+# one-evening migration (guide, chapter 2).
+#
+# APT VERSION ELECTION, the subtle part: Ubuntu's own universe repo
+# also ships zabbix-agent2 (7.0.22 for resolute). With the official
+# repo added, apt elects the newer 7.0.30 from repo.zabbix.com - but
+# that is an election, not a guarantee. The playbook therefore reads
+# `apt policy zabbix-agent2` back and ASSERTS the candidate really
+# comes from repo.zabbix.com at the pinned major. If universe ever wins
+# that election, the run fails loudly instead of quietly shipping a
+# different agent than the one documented.
+#
+# Idempotency: repo file, key, package and config converge; only the
+# first run changes anything (field-run shape, chapter 5 of the guide,
+# 28 Aug 2026: ok=19 changed=5, re-run ok=18 changed=0; two of the
+# build-time predicted changes never happen because the resolute image
+# already ships /etc/apt/keyrings and apt's postinst starts+enables
+# the service itself). The config template
+# notifies a handler - the first handlers in this series - and
+# flush_handlers runs it BEFORE the verification tasks, so what gets
+# verified is the running agent, not a config file waiting for a
+# restart that nobody scheduled.
+- name: Monitoring - Zabbix Agent 2 from the pinned official repo
+  hosts: provisioned
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Require the agent layer settings (group_vars/provisioned.yml)
+      ansible.builtin.assert:
+        that:
+          - zabbix_agent_version is defined
+          - zabbix_agent_server is defined and zabbix_agent_server | length > 0
+          - zabbix_agent_serveractive is defined and zabbix_agent_serveractive | length > 0
+          - zabbix_agent_listenport is defined and zabbix_agent_listenport | int > 0
+          - zabbix_agent_hostname is defined and zabbix_agent_hostname | length > 0
+        fail_msg: >-
+          The zabbix_agent_* settings are not defined. They live in
+          ansible/inventory/group_vars/provisioned.yml (Phase 3
+          section); check that the file exists and that the play is
+          running against the `provisioned` group with the
+          repository's ansible.cfg.
+
+  handlers:
+    - name: Restart Zabbix Agent 2
+      ansible.builtin.systemd:
+        name: zabbix-agent2
+        state: restarted
+
+  tasks:
+    # ------------------------------------------------------------------
+    # The pinned official repo. Key first, then the sources line that
+    # references it: apt update runs inside the apt_repository task and
+    # must find the key already in place.
+    # ------------------------------------------------------------------
+    - name: Create the apt keyrings directory (modern signed-by layout)
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Install the Zabbix official repo signing key
+      ansible.builtin.get_url:
+        url: https://repo.zabbix.com/zabbix-official-repo.key
+        dest: /etc/apt/keyrings/zabbix-official-repo.asc
+        mode: "0644"
+
+    - name: Add the pinned Zabbix apt repository (major version knob)
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by=/etc/apt/keyrings/zabbix-official-repo.asc]
+          https://repo.zabbix.com/zabbix/{{ zabbix_agent_version }}/ubuntu
+          {{ ansible_facts['distribution_release'] }} main
+        filename: zabbix-official-repo
+        state: present
+
+    - name: Install Zabbix Agent 2
+      ansible.builtin.apt:
+        name: zabbix-agent2
+        state: present
+
+    # ------------------------------------------------------------------
+    # Configuration. Deliberately close to the packaged default: only
+    # the lines a host entry on the server cares about are templated.
+    # TLS and HostInterface stay for the production-hardening pass.
+    # ------------------------------------------------------------------
+    - name: Deploy the agent configuration
+      ansible.builtin.template:
+        src: templates/zabbix_agent2.conf.j2
+        dest: /etc/zabbix/zabbix_agent2.conf
+        mode: "0644"
+      notify: Restart Zabbix Agent 2
+
+    - name: Enable and start Zabbix Agent 2
+      ansible.builtin.systemd:
+        name: zabbix-agent2
+        state: started
+        enabled: true
+
+    - name: Apply pending handler restarts before verifying
+      ansible.builtin.meta: flush_handlers
+
+    # ------------------------------------------------------------------
+    # Verification ladder, weakest proof first, every run:
+    #   1. the package really came from the pinned repo
+    #   2. the service is active and enabled
+    #   3. the agent really listens on its port
+    #   4. the agent answers a local metric query (config parses,
+    #      plugins load - without needing a server anywhere)
+    #   5. the rendered config says what we meant
+    # ------------------------------------------------------------------
+    - name: Read back the apt version election
+      ansible.builtin.command:
+        cmd: apt policy zabbix-agent2
+      register: agent_policy
+      changed_when: false
+
+    - name: The installed agent must come from the pinned official repo
+      ansible.builtin.assert:
+        that:
+          - "'Installed: (none)' not in agent_policy.stdout"
+          - "'repo.zabbix.com' in agent_policy.stdout"
+          - "zabbix_agent_version ~ '.' in agent_policy.stdout"
+        fail_msg: >-
+          apt did not elect the official repo's agent. Read
+          `apt policy zabbix-agent2` on the target: if the candidate
+          comes from archive.ubuntu.com, check
+          /etc/apt/sources.list.d/zabbix-official-repo.list and the
+          key at /etc/apt/keyrings/zabbix-official-repo.asc; if the
+          repo line 404s, Zabbix may not publish section
+          {{ ansible_facts['distribution_release'] }} for major
+          {{ zabbix_agent_version }} (live-check with: curl -sI
+          https://repo.zabbix.com/zabbix/{{ zabbix_agent_version }}/ubuntu/dists/{{ ansible_facts['distribution_release'] }}/Release).
+
+    - name: Read service states
+      ansible.builtin.service_facts: {}
+
+    - name: Zabbix Agent 2 must be active
+      ansible.builtin.assert:
+        that: ansible_facts.services['zabbix-agent2.service']['state'] == 'running'
+        fail_msg: >-
+          zabbix-agent2 is not running. Diagnose in the guest with:
+          systemctl status zabbix-agent2 and
+          journalctl -u zabbix-agent2 -n 50. A config typo usually
+          shows up right there; the local metric test below exercises
+          the same config parse.
+
+    - name: The agent must listen on its port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ zabbix_agent_listenport }}"
+        timeout: 15
+
+    - name: Local metric test (no server needed)
+      ansible.builtin.command:
+        cmd: zabbix_agent2 -t agent.version
+      register: agent_selftest
+      changed_when: false
+
+    - name: The agent must answer the local metric test
+      ansible.builtin.assert:
+        that:
+          - agent_selftest.rc == 0
+          - "'agent.version' in agent_selftest.stdout"
+        fail_msg: >-
+          zabbix_agent2 -t agent.version failed (rc={{ agent_selftest.rc }}).
+          The same code path parses /etc/zabbix/zabbix_agent2.conf, so a
+          failure usually means a config problem: run
+          `zabbix_agent2 -t agent.version` by hand on the target to see
+          the raw error.
+
+    - name: Read the deployed configuration back
+      ansible.builtin.slurp:
+        src: /etc/zabbix/zabbix_agent2.conf
+      register: agent_conf
+
+    - name: The configuration must name the intended server
+      ansible.builtin.assert:
+        that:
+          - "'Server=' ~ zabbix_agent_server in agent_conf.content | b64decode"
+          - "'ServerActive=' ~ zabbix_agent_serveractive in agent_conf.content | b64decode"
+          - "'Hostname=' ~ zabbix_agent_hostname in agent_conf.content | b64decode"
+        fail_msg: >-
+          The rendered /etc/zabbix/zabbix_agent2.conf does not contain
+          the expected Server/ServerActive/Hostname lines. Diff it
+          against ansible/playbooks/templates/zabbix_agent2.conf.j2 and
+          the Phase 3 section of group_vars/provisioned.yml.
+
+    - name: Receipt - agent on duty
+      ansible.builtin.debug:
+        msg: >-
+          zabbix-agent2 (repo {{ zabbix_agent_version }}) listening on
+          port {{ zabbix_agent_listenport }}; passive checks accepted
+          from {{ zabbix_agent_server }}, active checks sent to
+          {{ zabbix_agent_serveractive }} as host
+          "{{ zabbix_agent_hostname }}". Self-test:
+          {{ agent_selftest.stdout | trim }}

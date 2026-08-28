@@ -5,6 +5,9 @@
 #
 # Phase 1 used built-in modules only; Phase 2's LVM/XFS work needs
 # community.general (lvg, lvol, filesystem) and ansible.posix (mount).
+# Phase 3 (Zabbix Agent 2, rsyslog, stub installers) deliberately adds
+# NOTHING: 04/05/06 are ansible.builtin-only, so the control node's
+# collection set stays exactly this.
 
 collections:
   - name: community.general

@@ -7,8 +7,9 @@ configuration - all on shared NFS storage.
 This repository is the companion code for the **Proxmox Automation Series** and
 implements the automation described in the Phase 1 field guide
 (`docs/phase-1-guide.pdf`), the Phase 2 storage guide
-(`docs/phase-2-guide.pdf`), and the Phase 2 addendum
-(`docs/phase-2-addendum-guide.pdf`).
+(`docs/phase-2-guide.pdf`), the Phase 2 addendum
+(`docs/phase-2-addendum-guide.pdf`), and the Phase 3 agents guide
+(`docs/phase-3-agents-guide.pdf`, edition 2: field-verified 28 Aug 2026).
 
 ## What Phase 1 does
 
@@ -71,6 +72,36 @@ The addendum adds three pieces on top, all three field-verified
                                           NFS disk)     user, key)    agent)
 ```
 
+## What Phase 3 adds
+
+The agent layer, delivered as three more numbered playbooks (all
+ansible.builtin, `requirements.yml` unchanged):
+
+1. **`04_zabbix_agent.yml`** - Zabbix Agent 2 from the official repo,
+   pinned to the 7.0 LTS major (the only current major publishing
+   Ubuntu 26.04 packages; live-checked). The playbook reads the apt
+   version election back (`apt policy`) and asserts the agent really
+   came from repo.zabbix.com, then verifies service, port, a local
+   `zabbix_agent2 -t agent.version` metric and the rendered config.
+2. **`05_rsyslog_forward.yml`** - rsyslog (the 26.04 cloud image ships
+   it; the install task is a zero-cost guard) plus an `omfwd`
+   forwarding rule in the QRadar pattern: TCP, disk-assisted queue,
+   retry forever. Validates the config with
+   `rsyslogd -N1` and smoke-tests the path with a tagged `logger`
+   message.
+3. **`06_security_agents.yml`** - Trend Micro and ManageEngine as
+   **stub installers behind a marker contract**: the harness (dirs,
+   script, one-shot execution, verification, drift alarm) is real,
+   the payload is an echo until the licenses arrive.
+
+All knobs live in the same `group_vars/provisioned.yml` (Phase 3
+section). Lab stand-ins: ctrl-01 is both the log receiver (one socat
+line, port 5514 - run it under `nohup`, it dies with its SSH session
+otherwise; field-proven) and the polling host for `zabbix-get`
+(add the official 7.0 repo to ctrl-01 first: universe has no
+zabbix-get package for 26.04); an optional one-LXC Zabbix server
+recipe is in the guide.
+
 ## Verified versions (August 2026)
 
 | Component   | Version    | Notes                                        |
@@ -80,6 +111,7 @@ The addendum adds three pieces on top, all three field-verified
 | bpg/proxmox | ~> 0.111.1 | uses the new `proxmox_download_file` resource |
 | Ubuntu      | 26.04 LTS  | amd64v3 image needs x86-64-v3 CPU            |
 | Ansible     | core 2.20  | Ubuntu repo package; builtin modules only in Phase 1      |
+| zabbix-agent2 | 7.0.30 (7.0 LTS repo) | pinned major 7.0: the only current major publishing resolute (26.04) packages as of Aug 2026; universe fallback is 7.0.22 |
 
 ## Repository layout
 
@@ -99,11 +131,15 @@ proxmox-automation/
 │   ├── inventory/
 │   │   ├── hosts.yml           # static for Phase 1
 │   │   └── group_vars/
-│   │       └── provisioned.yml # storage layout: ONE list, two playbooks
+│   │       └── provisioned.yml # storage layout + Phase 3 agent knobs: ONE file, five playbooks
 │   └── playbooks/
 │       ├── 01_first_contact.yml
 │       ├── 02_storage.yml      # serial disks -> LVM -> XFS -> fstab
-│       └── 03_storage_verify.yml  # reboot + prove boot persistence
+│       ├── 03_storage_verify.yml  # reboot + prove boot persistence
+│       ├── 04_zabbix_agent.yml    # Zabbix Agent 2: pinned repo + verification ladder
+│       ├── 05_rsyslog_forward.yml # rsyslog -> TCP forward with disk queue (QRadar pattern)
+│       ├── 06_security_agents.yml # Trend/ManageEngine stub installers, marker contract
+│       └── templates/             # the series' first Jinja2 templates
 ├── scripts/
 │   ├── pve-bootstrap.sh        # API user + token (run on a PVE node)
 │   └── check-cpu-v3.sh         # x86-64-v3 feature check (run on host)
@@ -111,6 +147,7 @@ proxmox-automation/
 │   ├── phase-1-guide.pdf       # step-by-step field guide (Phase 1)
 │   ├── phase-2-guide.pdf       # serial disks + LVM/XFS + resize chain (Phase 2)
 │   └── phase-2-addendum-guide.pdf  # group_vars + verify playbook + growth
+│   └── phase-3-agents-guide.pdf    # agent layer: Zabbix Agent 2, rsyslog, stubs
 └── README.md
 ```
 
@@ -185,6 +222,23 @@ ssh ubuntu@<vm-ip> "df -h /srv/scratch"   # receipt lives in the guest
 #    if 02 reports scratch01 NOT FOUND: on the PVE node run
 #    `qm shutdown 200 && qm start 200` (a new disk's serial MAY need a
 #    full VM start; field run 1: it appeared immediately), then re-run
+
+# 10. Phase 3: agent layer. Receiver first, session-proof, on ctrl-01:
+sudo apt-get install -y socat
+nohup socat -u TCP-LISTEN:5514,reuseaddr,fork \
+  OPEN:/tmp/qradar-stub.log,creat,append >/dev/null 2>&1 &
+
+# 11. The three playbooks (builtin-only, any order, all idempotent;
+#     field-run recaps, 28 Aug 2026):
+ansible-playbook playbooks/04_zabbix_agent.yml    # ok=19 changed=5 (image ships /etc/apt/keyrings and apt's postinst starts the service, so two predicted changes never happen), re-run ok=18 changed=0
+ansible-playbook playbooks/05_rsyslog_forward.yml # ok=13 changed=3, re-run ok=12 changed=0, then:
+grep phase3-test /tmp/qradar-stub.log             # the tagged lines from vm-test-01 (if the receiver was down: they arrive late, via the queue)
+ansible-playbook playbooks/06_security_agents.yml # ok=8 changed=3, re-run ok=8 changed=0
+
+# 12. Optional last-mile proof from ctrl-01 (no server needed;
+#     universe has no zabbix-get, add the official 7.0 repo first):
+sudo apt-get install -y zabbix-get && zabbix_get -s 192.168.122.50 -k agent.version
+#     -> 7.0.30
 ```
 
 ## Key design decisions
@@ -211,6 +265,12 @@ ssh ubuntu@<vm-ip> "df -h /srv/scratch"   # receipt lives in the guest
 | Storage layout in `group_vars/provisioned.yml`, not playbook `vars:` | One list feeds the build (02) and the verify (03) playbooks; `--extra-vars` can still override for experiments |
 | Verify playbook reboots by design (`03_storage_verify.yml`) | fstab entries and LVM activation only prove themselves at boot; "should survive" is a weaker claim than "verified to survive" |
 | Fifth disk opt-in via `scratch_disk_size_gb = 0` + dynamic block | Growth stays declarative: the knob removes the disk block entirely when unused; mounting it is an Ansible-side concern (group_vars entry) |
+| Agent layer hand-rolled, not the community.zabbix role | the repo pin is explicit (7.0 LTS is the only current major publishing 26.04 packages), ctrl-01 installs no new collections, and the transcript stays visible; swap path documented in the Phase 3 guide |
+| apt version election asserted, not assumed | universe also ships zabbix-agent2 (7.0.22); with the official repo added apt elects 7.0.30, and 04 re-reads `apt policy` every run to prove it |
+| rsyslog forwarding via an omfwd action with a disk-assisted queue | the naive `*.* @@host:port` line loses messages while the receiver is down; LinkedList + queue.filename spills to /var/spool/rsyslog and retries forever. Field-proven 28 Aug 2026: the receiver died with its SSH session, the queue kept 193 KB across an rsyslog restart and delivered 942 lines late with original timestamps |
+| Stub installers behind a marker contract | the pipeline (deploy, run once, verify, upgrade semantics) is testable without licenses; only the payload is stubbed, and the swap-in keeps the marker byte-for-byte |
+| Phase 3 is ansible.builtin only | requirements.yml unchanged; the sandbox validation covers exactly what the field runs |
+| Lab receiver on port 5514, not 514 | an unprivileged port means no root daemon for the socat stub; production QRadar is a one-variable switch |
 
 ## Troubleshooting
 
@@ -227,6 +287,16 @@ Field-tested failures and their root causes:
 | 02_storage.yml reports `scratch01` (or any NEWLY added disk) NOT FOUND right after `terraform apply` | A newly attached disk's serial MAY reach the guest kernel only at the next FULL VM start (field run 1: it appeared immediately; resizing existing disks is always online) | On a PVE node: `qm shutdown 200 && qm start 200`, then re-run the playbook |
 | `terraform apply` announces `1 to destroy` and takes ~5 minutes | Upstream re-published the cloud image; `proxmox_download_file` re-downloads it on size change. The destroy targets the file artifact, NOT the VM (updated in-place) | Harmless; pin the artifact with `overwrite=false` in `template.tf` if you prefer reproducibility |
 | `df -h /srv/scratch` on ctrl-01 answers `No such file or directory` | The mount lives in the guest, not on the control node (field footnote from the growth run) | Read the receipt from the guest: `ssh ubuntu@<vm-ip> "df -h /srv/scratch"` |
+| 04 fails: apt update 404 on `repo.zabbix.com/.../dists/resolute/Release` | Zabbix has not published this Ubuntu release for the pinned major (8.0/8.2 lack resolute as of Aug 2026) | keep `zabbix_agent_version` on a major that publishes for your release; live-check with `curl -sI <url>` |
+| 04's election assert fails (candidate 7.0.22 from archive.ubuntu.com) | the official repo lost the apt election: key or sources line wrong | check `/etc/apt/keyrings/zabbix-official-repo.asc` + `/etc/apt/sources.list.d/zabbix-official-repo.list`, `apt update`, re-run |
+| 05 green but `/tmp/qradar-stub.log` stays empty | socat not running (field-proven cause: it died with the SSH session that started it), wrong port, or a TCP listener against the `udp` knob | check the guest-side `/var/log/syslog` line first (proves rsyslog), then `ss -tlnp \| grep 5514`, then `rsyslog_forward_protocol`; restart with the nohup form |
+| receiver file never appears although socat is LISTENing | socat creates the file on the FIRST inbound connection; rsyslog retries a suspended action every ~30 s | wait a minute and re-check; `ss -tn \| grep 5514` on the guest proves the wire |
+| receiver works, then dies some time later | a foreground one-liner dies with the SSH session that spawned it (SIGHUP) | run it session-proof: `nohup socat ... >/dev/null 2>&1 &` (learned the honest way, 28 Aug 2026) |
+| `zabbix-get` fails to install on ctrl-01: `Unable to locate package` | Ubuntu 26.04 universe carries no zabbix-get; only the official Zabbix repo publishes it | give ctrl-01 the 7.0 repo (guide ch. 2), or take the heavy path: the binary also ships inside `zabbix-server-pgsql` |
+| `wc -l` on the receiver file shows hundreds of lines after an outage | the rule forwards everything, so the backlog holds every syslog line from the outage window, including Ansible's per-command logging | normal by design; grep for the tag, do not count lines (field receipt: 942) |
+| `rsyslogd -N1` fails mentioning the queue and a work directory | the base `/etc/rsyslog.conf` lacks `global(workDirectory=...)`; `queue.filename` needs it | set it to `/var/spool/rsyslog` or drop `queue.filename` (Ubuntu's packaged conf ships it) |
+| 06's marker assert fails after a version bump | the drift alarm doing its job: old marker, new desired version | intended; force reinstall: `ansible provisioned -m file -a "path=/opt/TrendMicro/.installed state=absent" -b`, then re-run |
+| A server's Zabbix polls time out although 04 is green | `Server=` does not list the polling host; the agent silently drops untrusted polls | add the IP to `zabbix_agent_server` (comma-separated list), or poll from ctrl-01 with `zabbix-get` |
 | 03_storage_verify.yml reboots the VM | By design: that is the test (boot persistence) | Add `-e verify_reboot=false` for a no-downtime check (marker test becomes same-session) |
 | `03_storage_verify.yml`: `data_disks is not defined` | Play ran outside the repo's ansible.cfg / inventory, so `group_vars/provisioned.yml` was not loaded | Run from `ansible/` with the repo's `ansible.cfg`, or point `-i inventory/hosts.yml` explicitly |
 
@@ -236,7 +306,7 @@ Field-tested failures and their root causes:
 |-------|-------|--------|
 | 1 | Golden template + Terraform clone + cloud-init + first contact | **done, field-verified** (guide: `docs/phase-1-guide.pdf`) |
 | 2 | Multi-disk via disk `serial` attribute, LVM + XFS, online resize chain | **done, field-verified end to end, closed** (guide: `docs/phase-2-guide.pdf`; addendum edition 3: `docs/phase-2-addendum-guide.pdf` - group_vars + verify + growth all field-run; growth: 02 `ok=15 changed=5`, 03 `ok=28 changed=2 failed=0` with every device letter rotated at boot) |
-| 3 | Agent roles: Zabbix Agent 2, Trend Micro, ManageEngine, rsyslog to QRadar | planned |
+| 3 | Agent roles: Zabbix Agent 2, Trend Micro, ManageEngine, rsyslog to QRadar | **done, field-verified end to end, closed** (guide edition 2: `docs/phase-3-agents-guide.pdf`; every runbook step green 28 Aug 2026 - 04 `ok=19 changed=5`, 05 `ok=13 changed=3`, 06 `ok=8 changed=3`, all re-runs clean, `zabbix_get` answered 7.0.30; an accidental receiver outage proved the disk queue: 193 KB survived an rsyslog restart, 942 lines late-delivered with original timestamps) |
 | 4 | Semaphore UI form-driven pipeline, dynamic inventory, phone_home | planned |
 | 5 | Scale hardening: IPAM, parallelism limits, drift detection | planned |
 

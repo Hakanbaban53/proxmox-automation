@@ -1,0 +1,169 @@
+---
+# Phase 3, part 2: rsyslog forwarding, the QRadar pattern.
+#
+# A DB server that logs only to its own disk keeps its evidence next to
+# the incident. The production answer is central collection - in this
+# environment, QRadar - and the guest-side half of that answer is
+# always the same shape: rsyslog, forwarding everything, over TCP,
+# with a queue. This playbook installs and proves that half; the
+# receiver side is a lab stub (one socat line on ctrl-01) until the
+# licensed SIEM exists.
+#
+# The naive rule everyone writes first is:
+#     *.* @@receiver:514
+# It works on the happy path and loses messages on every other one:
+# while the receiver is down (maintenance, network, restart), UDP
+# silently drops and plain TCP either blocks local logging or drops
+# too, depending on the queue settings. The template this playbook
+# deploys is the production shape instead:
+#     action(type="omfwd" target=... port=... protocol="tcp"
+#            queue.type="LinkedList" queue.filename="qradar_fwd"
+#            queue.maxDiskSpace="100m" queue.saveOnShutdown="on"
+#            action.resumeRetryCount="-1")
+# - TCP, because QRadar's ingest expects reliable transport
+# - LinkedList + filename = a DISK-ASSISTED queue: in-memory while the
+#   receiver answers, spilling to /var/spool/rsyslog when it does not
+# - saveOnShutdown=on survives an agent restart with the queue intact
+# - resumeRetryCount=-1 retries forever instead of disabling the rule
+# The knob values live in group_vars (host, port, protocol, queue
+# size), so lab and production differ by variables, never by structure.
+#
+# Lab plumbing choices, honestly: the receiver port defaults to 5514,
+# not 514, so the lab stub needs no privileged port and no root daemon
+# on ctrl-01; QRadar in production listens on 514 (change the var).
+# The receiver itself is documented in the guide, session-proof form
+# (a plain foreground one-liner died with its SSH session on 28 Aug
+# 2026; run it under nohup so it survives the console):
+#     nohup socat -u TCP-LISTEN:5514,reuseaddr,fork \
+#       OPEN:/tmp/qradar-stub.log,creat,append >/dev/null 2>&1 &
+# Anything that appends lines to a file would serve; socat is just the
+# smallest one that speaks the right dialect.
+#
+# Edition 2 correction, field-proven 28 Aug 2026: the Ubuntu 26.04
+# cloud image DOES ship rsyslog. dpkg's log shows no install line at
+# all, only a first-boot trigger pass configuring it (2026-08-26
+# 16:16:19), and the package ships /var/spool/rsyslog itself - its
+# postinst sets mode 0700, owner syslog:adm, which the spool task
+# below normalizes to the declared 0755 (that normalization, not a
+# directory creation, is the first run's change there). The install
+# task stays as a zero-cost guard; only its name and this comment
+# changed in edition 2.
+#
+# Idempotency: spool mode, template and restart converge on the first
+# run (field-run shape, guide chapter 5, 28 Aug 2026: ok=13 changed=3,
+# re-run ok=12 changed=0). Every run ends with the same smoke test: a tagged
+# message through logger, then found in the LOCAL log (proving rsyslog
+# processed it) - the receiver-side line is the field receipt.
+- name: Logging - forward everything to the central receiver (QRadar pattern)
+  hosts: provisioned
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Require the forwarding settings (group_vars/provisioned.yml)
+      ansible.builtin.assert:
+        that:
+          - rsyslog_receiver_host is defined and rsyslog_receiver_host | length > 0
+          - rsyslog_receiver_port is defined and rsyslog_receiver_port | int > 0
+          - rsyslog_forward_protocol is defined
+          - rsyslog_forward_protocol in ['tcp', 'udp']
+          - rsyslog_queue_maxdisk is defined
+          - rsyslog_test_tag is defined and rsyslog_test_tag | length > 0
+        fail_msg: >-
+          The rsyslog_forward settings are not defined or the protocol
+          is not tcp/udp. They live in
+          ansible/inventory/group_vars/provisioned.yml (Phase 3
+          section); check that the file exists and that the play is
+          running against the `provisioned` group with the
+          repository's ansible.cfg.
+
+  handlers:
+    - name: Restart rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: restarted
+
+  tasks:
+    - name: Install rsyslog if absent (the resolute image ships it)
+      ansible.builtin.apt:
+        name: rsyslog
+        state: present
+
+    - name: Ensure the queue spool directory exists
+      ansible.builtin.file:
+        path: /var/spool/rsyslog
+        state: directory
+        mode: "0755"
+
+    - name: Deploy the forwarding rule
+      ansible.builtin.template:
+        src: templates/50-qradar-forward.conf.j2
+        dest: /etc/rsyslog.d/50-qradar-forward.conf
+        mode: "0644"
+      notify: Restart rsyslog
+
+    - name: Enable and start rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        state: started
+        enabled: true
+
+    - name: Apply pending handler restarts before verifying
+      ansible.builtin.meta: flush_handlers
+
+    # ------------------------------------------------------------------
+    # Verification. rsyslogd -N1 parses the FULL config (ours plus the
+    # packaged defaults) without running it - the cheapest possible
+    # "the daemon will actually start" proof. Then the smoke test:
+    # one tagged message in, one line out in the local log.
+    # ------------------------------------------------------------------
+    - name: Validate the full rsyslog configuration (dry-run parse)
+      ansible.builtin.command:
+        cmd: /usr/sbin/rsyslogd -N1
+      register: rsyslog_validate
+      changed_when: false
+
+    - name: The configuration must parse cleanly
+      ansible.builtin.assert:
+        that: rsyslog_validate.rc == 0
+        fail_msg: >-
+          rsyslogd -N1 rejected the configuration. Read the stderr in
+          the task result: the usual suspect is the disk-assisted
+          queue needing a work directory (see
+          /etc/rsyslog.conf, global workDirectory), or a typo in
+          /etc/rsyslog.d/50-qradar-forward.conf.
+
+    - name: Emit the smoke-test message
+      ansible.builtin.command:
+        cmd: 'logger -t {{ rsyslog_test_tag }} "phase 3 forwarding smoke message"'
+      changed_when: false
+
+    - name: The message must appear in the local log (rsyslog is async, hence retries)
+      ansible.builtin.command:
+        cmd: grep -F "{{ rsyslog_test_tag }}" /var/log/syslog
+      register: smoke_local
+      changed_when: false
+      until: smoke_local.rc == 0
+      retries: 6
+      delay: 2
+
+    - name: Confirm the local echo (rsyslog really processed it)
+      ansible.builtin.assert:
+        that:
+          - smoke_local.rc == 0
+          - "'phase 3 forwarding smoke message' in smoke_local.stdout"
+        fail_msg: >-
+          The tagged message never reached /var/log/syslog. Run
+          `systemctl status rsyslog` and `journalctl -u rsyslog -n 30`
+          on the target; a rule file that fails mid-parse leaves the
+          daemon running with the PREVIOUS config.
+
+    - name: Receipt - forwarding is live
+      ansible.builtin.debug:
+        msg: >-
+          rsyslog forwards *.* to {{ rsyslog_receiver_host }}:{{ rsyslog_receiver_port }}
+          over {{ rsyslog_forward_protocol | upper }} with a disk-assisted queue
+          ({{ rsyslog_queue_maxdisk }} at /var/spool/rsyslog). Local echo:
+          {{ smoke_local.stdout_lines[-1] | trim if smoke_local.stdout_lines else 'n/a' }}.
+          The receiver-side receipt lives on {{ rsyslog_receiver_host }}:
+          tail /tmp/qradar-stub.log (lab stub; see the guide runbook).

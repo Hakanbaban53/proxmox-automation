@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+# Phase 3 (05_rsyslog_forward.yml): forward everything to the central
+# receiver - the QRadar pattern. TCP plus a disk-assisted queue: while
+# the receiver is down, messages spill to /var/spool/rsyslog instead of
+# vanishing. Lab values: ctrl-01, port 5514 (unprivileged, so the socat
+# stub needs no root); production QRadar: port 514. Structure never
+# changes between the two, only the group_vars values do.
+action(type="omfwd"
+       target="{{ rsyslog_receiver_host }}"
+       port="{{ rsyslog_receiver_port }}"
+       protocol="{{ rsyslog_forward_protocol }}"
+       queue.type="LinkedList"
+       queue.filename="qradar_fwd"
+       queue.maxDiskSpace="{{ rsyslog_queue_maxdisk }}"
+       queue.saveOnShutdown="on"
+       action.resumeRetryCount="-1")
