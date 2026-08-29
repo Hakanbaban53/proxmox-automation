@@ -1,0 +1,63 @@
+---
+# Phase 4: VM profiles - the preset layer of the request form.
+#
+# The survey (Semaphore) or -e (CLI) sends a PROFILE name, and this file
+# turns it into a full VM specification: vCPU, RAM and the data-disk list.
+# The disk entries here carry only role + size; 00_provision_vm.yml derives
+# serial/vg/lv/mount from the role so the three sides can never disagree:
+#
+#   role "data"  ->  serial data01, vg vg_data, lv lv_data, mount /srv/data
+#
+# That derivation is deliberately identical to the field-proven Phase 2
+# layout in inventory/group_vars/provisioned.yml (terraform/vm.tf set the
+# same serials). The db-standard profile below therefore reproduces the
+# exact disk set the lab already ran with - the same guest-side playbook
+# (02_storage.yml) builds either path's disks.
+#
+# Sizes here are PRODUCTION-shaped. The lab's nfs-shared pool has only a
+# few hundred GB free: for lab validation use profile custom with small
+# sizes (e.g. 10 GB per disk) - see the Phase 4 guide, chapter 7.
+
+vm_profiles:
+  db-standard:
+    description: "Database server: 8 vCPU / 32 GB, four data disks"
+    vcpu: 8
+    ram_gb: 32
+    disks:
+      - { role: var,    size_gb: 100 }
+      - { role: log,    size_gb: 50 }
+      - { role: data,   size_gb: 1000 }
+      - { role: backup, size_gb: 500 }
+
+  web-small:
+    description: "Web/frontend server: 2 vCPU / 4 GB, no data disks"
+    vcpu: 2
+    ram_gb: 4
+    disks: []
+
+  app-medium:
+    description: "Application server: 4 vCPU / 16 GB, one app disk"
+    vcpu: 4
+    ram_gb: 16
+    disks:
+      - { role: app, size_gb: 100 }
+
+  custom:
+    # Everything comes from the survey/CLI at run time:
+    # vm_vcpu, vm_ram_gb, vm_disks (JSON list of {role, size_gb}).
+    description: "Custom: vCPU/RAM/disk list from the request form"
+    vcpu: 0
+    ram_gb: 0
+    disks: []
+
+# Roles the form may ask for. Anything else fails input validation -
+# an unknown mount point is a typo, not a decision the pipeline should
+# make silently. (Production mounts like /data /log /var /backup map
+# onto the same roles; the /srv/<role> lab convention is one variable.)
+vm_disk_roles: [var, log, data, backup, app, scratch]
+
+# Values the enum-based survey already enforces client-side; the assert
+# in 00_provision_vm.yml re-checks them server-side because -e and the
+# API path bypass the form.
+vm_allowed_vcpu: [2, 4, 8, 16, 32]
+vm_allowed_ram_gb: [4, 8, 16, 32, 64, 128]

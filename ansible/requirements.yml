@@ -1,16 +1,39 @@
 ---
 # Ansible collections required by this pipeline.
-# Install on the control node (ctrl-01) with:
+# Install on the control node (ctrl-01 for CLI runs, sem-01 for the
+# Semaphore deploy flow) with:
 #   ansible-galaxy collection install -r requirements.yml
 #
 # Phase 1 used built-in modules only; Phase 2's LVM/XFS work needs
 # community.general (lvg, lvol, filesystem) and ansible.posix (mount).
 # Phase 3 (Zabbix Agent 2, rsyslog, stub installers) deliberately adds
-# NOTHING: 04/05/06 are ansible.builtin-only, so the control node's
-# collection set stays exactly this.
+# NOTHING: 04/05/06 are ansible.builtin-only.
+#
+# Phase 4 adds community.proxmox (the proxmox content split out of
+# community.general into its own collection; 2.0.0 line, Aug 2026):
+# 00_provision_vm.yml uses its proxmox_kvm (clone + spec update),
+# proxmox_disk (serial-tagged data disks) and proxmox_vm_info
+# (idempotency guard). The collection ALSO needs two Python packages
+# on the control node - proxmoxer (>= 2.3) and requests:
+#   apt install python3-proxmoxer python3-requests   (Ubuntu/Debian)
+#
+# Pin note: community.proxmox 2.0.0 verified against PVE 9.2 in the lab;
+# the module-behavior notes in 00_provision_vm.yml (clone drops spec
+# params; update needs update_unsafe for net) reflect its source code.
+# The >= 2.0.0 pin is load-bearing (field-found on sem-01, 28 Aug 2026):
+# Ubuntu's `ansible` package bundles an OLDER community.proxmox in the
+# system path, and against an unpinned bare name galaxy answers
+# "Nothing to do. All requested collections are already installed" -
+# leaving the playbook without proxmox_disk's serial support. The
+# semaphore user's ~/.ansible/collections wins the runtime search
+# order, which is where 2.0.0 lands.
 
 collections:
   - name: community.general
     source: https://galaxy.ansible.com
   - name: ansible.posix
     source: https://galaxy.ansible.com
+  - name: community.proxmox
+    version: ">=2.0.0"
+    source: https://galaxy.ansible.com
+

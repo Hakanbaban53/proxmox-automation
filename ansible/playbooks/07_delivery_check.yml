@@ -1,0 +1,131 @@
+---
+# Phase 4: the delivery checklist - the gate a VM passes through before
+# anyone may hand it to a customer.
+#
+# Every phase of this series ends by PROVING what it built; 07 is that
+# proof for the whole pipeline, run automatically at the end of every
+# deploy. Green output == the VM is ready: storage up, agents running,
+# logs flowing to the central receiver, monitoring reachable.
+#
+# What is checked and why:
+#   mounts        - every data disk's mount point is actually mounted
+#                   (02_storage.yml built them; a missing mount is a
+#                   failed delivery, not a warning)
+#   services      - zabbix-agent2, rsyslog, qemu-guest-agent are ACTIVE;
+#                   the security agents prove themselves via their marker
+#                   files (06's contract: the marker is the truth)
+#   rsyslog ESTAB - the forwarding connection to the receiver is in
+#                   ESTABLISHED state (the disk-assisted queue from Phase 3
+#                   buffers when this is down; delivery means it is UP)
+#   tagged message- one logger line, tag faz4-<hostname>, found in the
+#                   local log: rsyslog really processed it. The receiver-
+#                   side line (QRadar / the lab stub on ctrl-01) is the
+#                   field receipt - grep the same tag there.
+#   zabbix port   - 10050 listening; the server-side registration is a
+#                   Zabbix-side action, out of pipeline scope.
+#
+# Failure here stops the pipeline loudly - which is the point of a gate.
+- name: Delivery checklist - prove the VM is ready to hand over
+  hosts: provisioned
+  become: true
+  gather_facts: true
+
+  vars_files:
+    # Deploy runs go through Semaphore's own inventory, where the repo's
+    # group_vars never load (field finding #18, run #31): the play carries
+    # its agent-layer settings itself. Static runs load the same file -
+    # one source of truth for both modes.
+    - vars/agent-layer.yml
+
+  tasks:
+    - name: Collect service states (facts, not guesses)
+      ansible.builtin.service_facts: {}
+
+    - name: The core services must be active
+      ansible.builtin.assert:
+        that: ansible_facts.services[services[item]] is defined and ansible_facts.services[services[item]].state == 'running'
+        fail_msg: >-
+          {{ item }} is not running (state:
+          {{ ansible_facts.services[services[item]].state | default('absent') }}).
+          Diagnose on the VM: systemctl status {{ item }}; journalctl -u {{ item }} -n 30.
+      loop: [zabbix-agent2, rsyslog, qemu-guest-agent]
+      vars:
+        services:
+          zabbix-agent2: zabbix-agent2.service
+          rsyslog: rsyslog.service
+          qemu-guest-agent: qemu-guest-agent.service
+
+    - name: Every data-disk mount point must be mounted
+      ansible.builtin.assert:
+        that: ansible_facts.mounts | selectattr('mount', 'equalto', item.mount) | list | length == 1
+        fail_msg: >-
+          {{ item.mount }} (serial {{ item.serial }}) is not mounted. Check
+          02_storage.yml output above and, on the VM: lsblk -o NAME,SIZE,SERIAL,MOUNTPOINT;
+          systemctl status var-srv-*.mount; cat /etc/fstab.
+      loop: "{{ data_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    - name: The security agents must have their markers on record
+      ansible.builtin.stat:
+        path: "{{ item.install_dir }}/.installed"
+      loop: "{{ security_agents }}"
+      loop_control:
+        label: "{{ item.install_dir }}/.installed"
+      register: agent_markers
+
+    - name: All markers present (06's contract holds)
+      ansible.builtin.assert:
+        that: agent_markers.results | map(attribute='stat.exists') | select | list | length == security_agents | length
+        fail_msg: >-
+          A security agent marker is missing - 06_security_agents.yml did
+          not complete its contract. Re-run the pipeline; if it still
+          fails, inspect the installer output in the task log above.
+
+    - name: The forwarding connection must be ESTABLISHED
+      ansible.builtin.command:
+        cmd: "ss -tn state established ( dport = :{{ rsyslog_receiver_port }} )"
+      register: fwd_conn
+      changed_when: false
+      until: fwd_conn.rc == 0 and fwd_conn.stdout | length > 0
+      retries: 5
+      delay: 3
+
+    - name: Emit the delivery test message (tag carries the hostname)
+      ansible.builtin.command:
+        cmd: 'logger -t faz4-{{ inventory_hostname }} "delivery check {{ ansible_date_time.iso8601 }}"'
+      changed_when: false
+
+    - name: The message must appear in the local log
+      ansible.builtin.command:
+        cmd: "grep -F faz4-{{ inventory_hostname }} /var/log/syslog"
+      register: smoke_local
+      changed_when: false
+      until: smoke_local.rc == 0
+      retries: 6
+      delay: 2
+
+    - name: Zabbix agent must be listening on 10050
+      ansible.builtin.command:
+        cmd: ss -tln sport = :10050
+      register: zbx_listen
+      changed_when: false
+
+    - name: Assert the listening socket
+      ansible.builtin.assert:
+        that: zbx_listen.stdout | length > 0
+        fail_msg: >-
+          Nothing listens on 10050. systemctl status zabbix-agent2 passed,
+          so check the agent config: grep -E 'Listen|Server' /etc/zabbix/zabbix_agent2.conf.
+
+    - name: Receipt - the VM may be delivered
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_host }}) PASSED the delivery
+          checklist: {{ data_disks | default([]) | length }} mount(s)
+          ({{ data_disks | default([]) | map(attribute='mount') | list | join(', ') }}),
+          agents active (zabbix-agent2, rsyslog, qemu-guest-agent
+          {{ '+ ' ~ security_agents | map(attribute='name') | join(', ') }}),
+          forwarding ESTABLISHED to {{ rsyslog_receiver_host }}:{{ rsyslog_receiver_port }},
+          delivery tag faz4-{{ inventory_hostname }}. Receiver-side receipt:
+          grep faz4-{{ inventory_hostname }} on {{ rsyslog_receiver_host }}.

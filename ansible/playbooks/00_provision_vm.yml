@@ -1,0 +1,332 @@
+---
+# Phase 4: Ansible-native provisioning - the Terraform replacement.
+#
+# What this play does, in order:
+#   0. validates the request (profile, hostname, IP, custom specs)
+#   1. resolves the profile into vCPU / RAM / data-disk list
+#   2. checks whether a VM with that hostname already exists
+#   3. CLONES the golden template (vmid 9000) with a full copy on nfs-shared
+#   4. APPLIES the spec to the clone: CPU, RAM, net0 (+VLAN tag), the
+#      cloud-init drive (ide2), ipconfig0, ssh keys, DNS, agent, onboot
+#   5. ATTACHES the serial-tagged data disks (scsi1..n, serial=<role>01)
+#   6. STARTS the VM, waits for SSH, and registers it in the `provisioned`
+#      group so playbooks 01-07 (agents, storage, delivery check) pick it
+#      up in the same run - see deploy_vm.yml, the master playbook.
+#
+# Why clone and configure are TWO tasks (a module behavior worth knowing,
+# verified against community.proxmox 2.0.0 source): in proxmox_kvm's clone
+# branch only format/full/pool/snapname/storage/target are forwarded to the
+# clone API call. cores/memory/net/ipconfig/sshkeys passed alongside clone
+# are silently DROPPED. The spec reaches the clone through a follow-up
+# update (config.set). The update path skips net/disk interfaces unless
+# update_unsafe: true - safe here because a fresh clone has nothing to
+# clobber, and on re-runs the values are identical.
+#
+# Idempotency, honestly: proxmox_kvm's clone mode does NOT check whether a
+# VM with the target NAME already exists (a re-run would clone again under
+# the next free VMID). Step 2 is therefore not an optimization but the
+# idempotency guard: existing VM -> skip clone, re-apply specs, re-attach
+# disks (create: regular is a no-op on existing disks), ensure running.
+# The whole chain is then safe to re-run.
+#
+# Secrets: the four PROXMOX_* values come from environment variables when
+# available (Semaphore Environment / shell export), falling back to the
+# lab defaults in vars/lab-environment.yml. The token never lives in git.
+#
+# CLI example (lab smoke test - small disks, the nfs pool is not huge):
+#   ansible-playbook -i inventory/provisioning.yml playbooks/deploy_vm.yml \
+#     -e vm_profile=custom -e vm_hostname=vm-faz4-01 -e vm_ip=192.168.122.60 \
+#     -e vm_vcpu=2 -e vm_ram_gb=4 \
+#     -e 'vm_disks=[{"role":"data","size_gb":10}]'
+- name: Phase 4 - provision a VM on Proxmox (Ansible-native)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/profiles.yml
+    - vars/lab-environment.yml
+
+  vars:
+    # ---- the request (survey fields / -e; see semaphore/README.md) -------
+    vm_profile: "custom"   # db-standard | web-small | app-medium | custom
+    vm_hostname: ""        # DNS-safe hostname, doubles as the PVE VM name
+    vm_ip: ""              # IPv4 without CIDR, e.g. 192.168.122.60
+    vm_vlan: 0             # 0 = untagged; 1-4094 adds tag= to net0
+    vm_vcpu: 0             # custom profile only
+    vm_ram_gb: 0           # custom profile only
+    vm_disks: ""           # optional JSON list [{role,size_gb}]; overrides profile disks
+    vm_vmid: 0             # optional explicit VMID; 0 = next free
+
+  pre_tasks:
+    - name: Require the API token (env or lab default)
+      ansible.builtin.assert:
+        that: proxmox_api_token_secret | length > 0
+        fail_msg: >-
+          PROXMOX_TOKEN_SECRET is empty. Export the four PROXMOX_* variables
+          (see semaphore/env/proxmox.env.example) or set the fallback in
+          ansible/playbooks/vars/lab-environment.yml.
+
+    - name: Validate the request (the form is UX; THIS is the gate)
+      ansible.builtin.assert:
+        that:
+          - vm_profile in vm_profiles
+          - vm_hostname is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+          - vm_hostname | length >= 3
+          - vm_ip is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+          - vm_vlan | int >= 0 and vm_vlan | int <= 4094
+        fail_msg: >-
+          Invalid request: profile must be one of {{ vm_profiles.keys() | list }},
+          hostname lowercase DNS-safe (3+ chars), vm_ip a dotted IPv4,
+          vm_vlan 0-4094. Received: profile={{ vm_profile }},
+          hostname={{ vm_hostname }}, ip={{ vm_ip }}, vlan={{ vm_vlan }}.
+
+  tasks:
+    # ------------------------------------------------------------------
+    # 1. Resolve the profile into a full specification.
+    # ------------------------------------------------------------------
+    - name: Resolve vCPU and RAM from the profile (custom uses the request)
+      ansible.builtin.set_fact:
+        spec_vcpu: "{{ (vm_vcpu | int) if vm_profile == 'custom' else vm_profiles[vm_profile].vcpu }}"
+        spec_ram_gb: "{{ (vm_ram_gb | int) if vm_profile == 'custom' else vm_profiles[vm_profile].ram_gb }}"
+
+    - name: Validate the specs (allowed sets + node vCPU cap)
+      ansible.builtin.assert:
+        that:
+          - spec_vcpu | int in vm_allowed_vcpu
+          - spec_ram_gb | int in vm_allowed_ram_gb
+          - spec_vcpu | int <= vm_max_vcpu | int   # finding #12: fail before the clone
+        fail_msg: >-
+          vCPU {{ spec_vcpu }} / RAM {{ spec_ram_gb }} GB outside
+          {{ vm_allowed_vcpu }} / {{ vm_allowed_ram_gb }}, or above the
+          node cap vm_max_vcpu={{ vm_max_vcpu }}.
+
+    - name: Parse the custom disk list (JSON from the form's text field)
+      ansible.builtin.set_fact:
+        request_disks: "{{ (vm_disks | from_json) if vm_disks | length > 0 else vm_profiles[vm_profile].disks }}"
+
+    - name: Validate the disk roles (typo guard, not a free-form field)
+      ansible.builtin.assert:
+        that:
+          - request_disks | length <= 8
+          - request_disks | map(attribute='role') | list | length
+             == request_disks | map(attribute='role') | unique | list | length
+          - request_disks | map(attribute='role') | list
+             == request_disks | map(attribute='role') | select('in', vm_disk_roles) | list
+          - request_disks | map(attribute='size_gb') | map('int') | select('>', 0) | list | length
+             == request_disks | length
+        fail_msg: >-
+          Disk list invalid: max 8 disks, unique roles from
+          {{ vm_disk_roles }}, size_gb a positive integer. Received:
+          {{ request_disks }}.
+
+    - name: Initialize the disk record list (empty for diskless profiles)
+      # Must exist even when the profile has no disks: the loop below
+      # would skip itself on an empty list and leave the variable
+      # undefined - caught by the web-small logic test, fixed here.
+      ansible.builtin.set_fact:
+        final_data_disks: []
+
+    - name: Derive the full disk records (role -> serial/vg/lv/mount)
+      # Loop + append, not a Jinja comprehension: dict literals with
+      # commas inside a comprehension break the Jinja parser (verified:
+      # "expected token ',', got 'for'") - the same reason 02_storage.yml
+      # builds its serial map with a loop.
+      ansible.builtin.set_fact:
+        final_data_disks: >-
+          {{ final_data_disks | default([])
+             + [{'serial': item.role ~ '01',
+                 'vg': 'vg_' ~ item.role,
+                 'lv': 'lv_' ~ item.role,
+                 'mount': '/srv/' ~ item.role,
+                 'size_gb': item.size_gb | int}] }}
+      loop: "{{ request_disks }}"
+      loop_control:
+        label: "{{ item.role }} -> {{ item.role }}01"
+
+    # ------------------------------------------------------------------
+    # 2. Does this hostname already exist? (idempotency guard)
+    # ------------------------------------------------------------------
+    - name: Look up existing VMs with this name
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        type: qemu
+        name: "{{ vm_hostname }}"
+        config: current           # ide2 presence decides the re-run path below
+      register: existing_vms
+
+    - name: Show what exists (and fix the target VMID accordingly)
+      ansible.builtin.set_fact:
+        target_vmid: "{{ existing_vms.proxmox_vms[0].vmid | int
+                         if existing_vms.proxmox_vms | length > 0 else 0 }}"
+        vm_already_exists: "{{ existing_vms.proxmox_vms | length > 0 }}"
+        # Does the existing VM already carry its cloud-init drive? Re-applying
+        # ide2 re-ALLOCATES the cloudinit disk -> PVE 500 "already exists"
+        # (field finding #10, task #4). Fresh clones: false; re-runs: true.
+        vm_has_cloudinit: "{{ existing_vms.proxmox_vms | length > 0
+                              and 'cloudinit' in (existing_vms.proxmox_vms[0].config.ide2 | default('')) }}"
+        # Existing net0 MAC, pinned on the adoption path (field finding
+        # #17, run #32): the apply task resubmits net0 on the running VM,
+        # and a net0 line WITHOUT a macaddr makes PVE regenerate the MAC
+        # and hot-replace the NIC - the guest KEEPS its IP (field probes:
+        # ping answered, guest agent answered, sshd listening) but the
+        # controller's SSH path broke for the full 600 s. Empty on fresh
+        # clones (nothing to pin).
+        vm_existing_mac: "{{ (existing_vms.proxmox_vms[0].config.net0 | default('')
+                              | regex_findall('(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}') | list
+                              | first | default(''))
+                              if existing_vms.proxmox_vms | length > 0 else '' }}"
+
+    # ------------------------------------------------------------------
+    # 3. Clone - specs travel in the NEXT task, not this one.
+    # ------------------------------------------------------------------
+    - name: Clone the golden template (full copy on nfs-shared)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        clone: "{{ proxmox_template_name }}"
+        vmid: "{{ proxmox_template_vmid }}"          # source
+        newid: "{{ vm_vmid | int if vm_vmid | int > 0 else omit }}"
+        name: "{{ vm_hostname }}"
+        full: true
+        storage: "{{ proxmox_storage }}"
+      register: pve_clone
+      when: not vm_already_exists | bool
+
+    - name: Record the fresh clone's VMID
+      ansible.builtin.set_fact:
+        target_vmid: "{{ pve_clone.vmid | int }}"
+      when: not vm_already_exists | bool
+
+    # ------------------------------------------------------------------
+    # 4. Apply the spec (update on the clone's VMID).
+    #    ide2 = the cloud-init drive: the template has NO cloud-init disk
+    #    (Phase 1 kept initialization on the workload), so the clone gets
+    #    one here; ipconfig/sshkeys/ciuser render into it.
+    # ------------------------------------------------------------------
+    - name: Apply the VM specification (cloud-init, network, CPU, memory)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ target_vmid }}"
+        name: "{{ vm_hostname }}"
+        update: true
+        update_unsafe: true        # net0 + ide2 are in the "unsafe" update set
+        cores: "{{ spec_vcpu | int }}"
+        sockets: 1
+        memory: "{{ (spec_ram_gb | int) * 1024 }}"
+        scsihw: virtio-scsi-pci    # same controller the template and terraform used
+        agent: "1"
+        onboot: true
+        tags: [pipeline-managed]
+        net:
+          # macaddr pins the EXISTING MAC when adopting a running VM:
+          # without it PVE regenerates the MAC on update and
+          # hot-replaces the NIC - the guest keeps its IP but the
+          # controller's SSH path dies (finding #17: run #32 timed out
+          # at 600 s; with the pin, run #36 passed the same path in
+          # ~10 s). Fresh clones send no macaddr and keep getting a
+          # generated one, as before.
+          net0: >-
+            {{ 'virtio,bridge=' ~ vm_bridge
+               ~ (',macaddr=' ~ vm_existing_mac if vm_existing_mac | length > 0 else '')
+               ~ (',tag=' ~ (vm_vlan | string) if vm_vlan | int > 0 else '') }}
+        # cloud-init drive: sent ONLY when the VM does not carry one yet -
+        # the template has none (Phase 1 kept initialization on the workload),
+        # so fresh clones get it here; existing VMs keep theirs untouched.
+        # ipconfig/sshkeys/ciuser above still update on every run and PVE
+        # re-renders them into the existing ISO.
+        ide: "{{ {'ide2': proxmox_cloudinit_storage ~ ':cloudinit'} if not vm_has_cloudinit | bool else omit }}"
+        ciuser: "{{ vm_username }}"
+        sshkeys: "{{ lookup('ansible.builtin.file', deploy_ssh_public_key_path) }}"
+        nameservers: "{{ vm_dns_servers }}"
+        searchdomains: "{{ vm_search_domains }}"
+        ipconfig:
+          ipconfig0: "ip={{ vm_ip }}/{{ vm_ip_cidr }},gw={{ vm_ip_gateway }}"
+
+    # ------------------------------------------------------------------
+    # 5. Attach the serial-tagged data disks.
+    #    create: regular = create if missing, else update options -> an
+    #    idempotent no-op on re-runs. Sizes are GiB, no suffix.
+    # ------------------------------------------------------------------
+    - name: Attach serial-tagged data disks (scsi1..n)
+      community.proxmox.proxmox_disk:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        vmid: "{{ target_vmid }}"
+        disk: "scsi{{ disk_index + 1 }}"
+        storage: "{{ proxmox_storage }}"
+        size: "{{ item.size_gb | string }}"
+        serial: "{{ item.serial }}"
+        ssd: true
+        discard: on
+        state: present
+        create: regular
+      loop: "{{ final_data_disks }}"
+      loop_control:
+        index_var: disk_index
+        label: "scsi{{ disk_index + 1 }} {{ item.serial }} {{ item.size_gb }}G"
+
+    # ------------------------------------------------------------------
+    # 6. Start, wait for SSH, register for the agent playbooks.
+    # ------------------------------------------------------------------
+    - name: Ensure the VM is running
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        vmid: "{{ target_vmid }}"
+        state: started
+        # 30 s module default is too tight when ide2 cloud-init ISO has to be
+        # generated on NFS (field finding #9: task #3 died on the default).
+        timeout: 300
+
+    - name: Wait for SSH (cloud-init brings the interface up on first boot)
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip }}"
+        port: 22
+        delay: 10
+        timeout: 600
+
+    - name: "Register the VM with the agent playbooks (group: provisioned)"
+      ansible.builtin.add_host:
+        name: "{{ vm_hostname }}"
+        groups: provisioned
+        ansible_host: "{{ vm_ip }}"
+        ansible_user: "{{ vm_username }}"
+        ansible_ssh_private_key_file: "{{ deploy_ssh_private_key_path }}"
+        data_disks: "{{ final_data_disks }}"
+
+    - name: Receipt - what this play delivered
+      ansible.builtin.debug:
+        msg: >-
+          {{ vm_hostname }} = VMID {{ target_vmid }} on {{ proxmox_node }}
+          ({{ 'reconfigured, existed' if vm_already_exists | bool else 'fresh clone' }}):
+          {{ spec_vcpu }} vCPU, {{ spec_ram_gb }} GB RAM,
+          {{ final_data_disks | length }} data disk(s)
+          {{ final_data_disks | map(attribute='serial') | list | join(',') }},
+          ip {{ vm_ip }}/{{ vm_ip_cidr }}
+          {{ '(tag ' ~ vm_vlan ~ ')' if vm_vlan | int > 0 else '(untagged)' }}.
+          Provisioning took over where Terraform left; agents are next.

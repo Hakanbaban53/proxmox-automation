@@ -47,8 +47,15 @@
   become: true
   gather_facts: true
 
+  vars_files:
+    # Deploy runs go through Semaphore's own inventory, where the repo's
+    # group_vars never load (field finding #18, run #31): the play carries
+    # its agent-layer settings itself. Static runs load the same file -
+    # one source of truth for both modes.
+    - vars/agent-layer.yml
+
   pre_tasks:
-    - name: Require the agent layer settings (group_vars/provisioned.yml)
+    - name: Require the agent layer settings (vars/agent-layer.yml)
       ansible.builtin.assert:
         that:
           - zabbix_agent_version is defined
@@ -58,10 +65,9 @@
           - zabbix_agent_hostname is defined and zabbix_agent_hostname | length > 0
         fail_msg: >-
           The zabbix_agent_* settings are not defined. They live in
-          ansible/inventory/group_vars/provisioned.yml (Phase 3
-          section); check that the file exists and that the play is
-          running against the `provisioned` group with the
-          repository's ansible.cfg.
+          ansible/playbooks/vars/agent-layer.yml, loaded by this play's
+          vars_files (deploy runs through Semaphore's own inventory never
+          see group_vars - field finding #18).
 
   handlers:
     - name: Restart Zabbix Agent 2
@@ -87,6 +93,9 @@
         dest: /etc/apt/keyrings/zabbix-official-repo.asc
         mode: "0644"
 
+    - name: Wait out the first-boot apt race before touching packages
+      ansible.builtin.include_tasks: tasks/wait_for_apt.yml
+
     - name: Add the pinned Zabbix apt repository (major version knob)
       ansible.builtin.apt_repository:
         repo: >-
@@ -95,11 +104,16 @@
           {{ ansible_facts['distribution_release'] }} main
         filename: zabbix-official-repo
         state: present
+        # NO lock_timeout here: ansible.builtin.apt_repository rejects it
+        # (field finding #19, run #36 - my #14v2 patch overreached; apt
+        # takes it, apt_repository does not). The v3 lock-based gate
+        # included just above already cleared the dpkg/apt locks.
 
     - name: Install Zabbix Agent 2
       ansible.builtin.apt:
         name: zabbix-agent2
         state: present
+        lock_timeout: 1800
 
     # ------------------------------------------------------------------
     # Configuration. Deliberately close to the packaged default: only

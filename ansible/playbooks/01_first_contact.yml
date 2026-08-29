@@ -16,11 +16,15 @@
           kernel {{ ansible_facts['kernel'] }},
           uptime {{ (ansible_facts['uptime_seconds'] / 60) | round(1) }} minutes
 
+    - name: Wait out the first-boot apt race before touching packages
+      ansible.builtin.include_tasks: tasks/wait_for_apt.yml
+
     - name: Install QEMU guest agent (lets Proxmox see this VM's IP)
       ansible.builtin.apt:
         name: qemu-guest-agent
         state: present
         update_cache: true
+        lock_timeout: 1800
 
     - name: Enable and start the guest agent
       ansible.builtin.service:
@@ -31,8 +35,10 @@
     - name: Mark the VM as managed by this pipeline
       ansible.builtin.copy:
         content: |
-          provisioned-by: terraform + bpg/proxmox (proxmox-automation)
-          phase: 1
+          provisioned-by: proxmox-automation (phase 4)
+          engine: ansible-native - community.proxmox clone + cloud-init + serial disks
+          (phases 1-3 heritage: terraform + bpg/proxmox built the same artifacts)
+          phase: 4
           node: {{ ansible_facts['hostname'] }}
         dest: /etc/provisioned-by
         owner: root

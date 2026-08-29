@@ -8,6 +8,15 @@
 # -e / --extra-vars, which always beats group_vars. The TASKS below are
 # unchanged from the field-verified v2 - only where the list lives moved.
 #
+# v4: two additions. (1) The deploy pipeline (deploy_vm.yml) feeds this
+# playbook a DYNAMIC data_disks through add_host - the profile's disk
+# list instead of the static group_vars one - so profile disks like
+# app01 (app-medium) build with the same field-proven tasks. (2) VMs
+# provisioned with NO data disks (web-small profile) would fail the
+# assert below, so the play now ends itself early when the list is
+# empty: a web server needs no LVM stack, and a green no-op is an
+# honest result.
+#
 # The problem this replaces (from the field): on DB servers with 4-5 extra
 # disks, /dev/sdb /dev/sdc ... letters do NOT map 1:1 to hypervisor disks,
 # so engineers resized disks by trial and error to find out which was
@@ -40,14 +49,22 @@
   gather_facts: true
 
   pre_tasks:
-    - name: Require the storage layout (group_vars/provisioned.yml)
+    - name: End the play when this VM has no data disks (web-small)
+      ansible.builtin.meta: end_host
+      when: data_disks is defined and data_disks | length == 0
+
+    - name: Require the storage layout (group_vars or the deploy pipeline)
       ansible.builtin.assert:
         that: data_disks is defined and data_disks | length > 0
         fail_msg: >-
-          data_disks is not defined. The storage layout lives in
-          ansible/inventory/group_vars/provisioned.yml; check that the file
-          exists and that the play is running against the `provisioned`
-          group with the repository's ansible.cfg.
+          data_disks is not defined. Static runs read it from
+          ansible/inventory/group_vars/provisioned.yml; deploy runs get it
+          from 00_provision_vm.yml via add_host (profile disks). Check
+          that the play is running against the `provisioned` group with
+          one of the repository's two ansible.cfg files.
+
+    - name: Wait out the first-boot apt race before touching packages
+      ansible.builtin.include_tasks: tasks/wait_for_apt.yml
 
     - name: Install LVM and XFS tooling (Ubuntu cloud images ship without them)
       ansible.builtin.apt:
@@ -56,6 +73,7 @@
           - xfsprogs
         state: present
         update_cache: true
+        lock_timeout: 1800
 
   tasks:
     # ------------------------------------------------------------------

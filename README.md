@@ -1,15 +1,17 @@
 # proxmox-automation
 
-Zero-touch VM provisioning on Proxmox VE: Terraform-managed golden templates,
-cloud-init networking, serial-tagged LVM/XFS data disks, and Ansible
-configuration - all on shared NFS storage.
+Zero-touch VM delivery on Proxmox VE: Ansible-native provisioning of
+golden-template clones (Phase 4; Terraform through Phase 3), cloud-init
+networking, serial-tagged LVM/XFS data disks, the full agent layer, and a
+Semaphore UI request form - all on shared NFS storage.
 
 This repository is the companion code for the **Proxmox Automation Series** and
 implements the automation described in the Phase 1 field guide
 (`docs/phase-1-guide.pdf`), the Phase 2 storage guide
 (`docs/phase-2-guide.pdf`), the Phase 2 addendum
-(`docs/phase-2-addendum-guide.pdf`), and the Phase 3 agents guide
-(`docs/phase-3-agents-guide.pdf`, edition 2: field-verified 28 Aug 2026).
+(`docs/phase-2-addendum-guide.pdf`), the Phase 3 agents guide
+(`docs/phase-3-agents-guide.pdf`, edition 2: field-verified 28 Aug 2026),
+and the Phase 4 delivery guide (`docs/phase-4-semaphore-guide.pdf`).
 
 ## What Phase 1 does
 
@@ -102,6 +104,40 @@ otherwise; field-proven) and the polling host for `zabbix-get`
 zabbix-get package for 26.04); an optional one-LXC Zabbix server
 recipe is in the guide.
 
+## What Phase 4 adds
+
+The delivery pipeline: one form submission on a ready-made UI, no custom
+web app to maintain, no Terraform state file either.
+
+1. **Ansible-native provisioning** (`00_provision_vm.yml`): clone + specs
+   + cloud-init + serial-tagged data disks through `community.proxmox`
+   alone (proxmox_kvm / proxmox_disk / proxmox_vm_info, collection 2.0.0).
+   Terraform is retired to `terraform/` for reference - the state-file
+   dance with externally-deleted VMs is over.
+2. **Profiles** (`playbooks/vars/profiles.yml`): `db-standard`,
+   `web-small`, `app-medium`, `custom` - the preset layer of the request
+   form. Disk serials/VGs/LVs/mounts are DERIVED from the role, so the
+   form cannot mistype them.
+3. **Semaphore UI** on its own LXC (sem-01, `scripts/create-sem-01.sh` +
+   `sem-01-setup.sh`): typed survey form (enum/integer/text), full task
+   audit (who/when/which values/output), job history. Why not AWX: its
+   last stable release is 24.6.1 from July 2024 (releases paused during
+   a large-scale refactoring - verified 28 Aug 2026); Semaphore ships
+   every 1-2 weeks (v2.19.11: 27 Aug 2026).
+4. **The delivery gate** (`07_delivery_check.yml`): mounts up, agents
+   active, forwarding ESTABLISHED, a tagged `faz4-<hostname>` test
+   message - green output IS the handover record.
+
+```
+ engineer ──► Semaphore form (profile, hostname, IP, VLAN, disks JSON)
+                │
+                ▼  deploy_vm.yml (one chain, one audit record)
+   00 clone+cloud-init+serial disks ──► 01 guest agent ──► 02 LVM/XFS
+   ──► 04 Zabbix ──► 05 rsyslog->QRadar ──► 06 Trend/ME stubs ──► 07 gate
+                                                                    │
+     VM delivered ◄── green receipt ─────────────────────────────────┘
+```
+
 ## Verified versions (August 2026)
 
 | Component   | Version    | Notes                                        |
@@ -112,42 +148,52 @@ recipe is in the guide.
 | Ubuntu      | 26.04 LTS  | amd64v3 image needs x86-64-v3 CPU            |
 | Ansible     | core 2.20  | Ubuntu repo package; builtin modules only in Phase 1      |
 | zabbix-agent2 | 7.0.30 (7.0 LTS repo) | pinned major 7.0: the only current major publishing resolute (26.04) packages as of Aug 2026; universe fallback is 7.0.22 |
+| community.proxmox | 2.0.0 | Phase 4: proxmox content split from community.general into its own collection; needs python3-proxmoxer + python3-requests |
+| Semaphore UI | 2.19.11 | Phase 4: .deb from GitHub releases; SQLite default dialect; config `port` must be a STRING; the setup script's password generator must be pipefail-safe (field-found on sem-01: `tr | head -c` aborts the script under `set -euo pipefail`) |
 
 ## Repository layout
 
 ```
 proxmox-automation/
-├── terraform/                  # infrastructure as code
-│   ├── versions.tf             # terraform + provider pins
-│   ├── providers.tf            # PVE API connection (token, TLS)
-│   ├── variables.tf            # every knob, documented
-│   ├── template.tf             # image download + golden template
-│   ├── vm.tf                   # workload clone + cloud-init
-│   ├── outputs.tf              # VMID, IP, ready-to-run ssh command
-│   └── terraform.tfvars.example# copy to terraform.tfvars and edit
+├── ansible.cfg                # ROOT cfg: used when running from repo root (how
+│                              # Semaphore runs); deploys use inventory/provisioning.yml
+├── terraform/                  # RETIRED for provisioning (Phase 4 went Ansible-
+│   ...                         # native); kept runnable for reference
 ├── ansible/
-│   ├── ansible.cfg
-│   ├── requirements.yml        # community.general + ansible.posix (Phase 2)
+│   ├── ansible.cfg             # cd ansible && ... (maintenance runs, hosts.yml)
+│   ├── requirements.yml        # community.general + ansible.posix + community.proxmox
 │   ├── inventory/
-│   │   ├── hosts.yml           # static for Phase 1
+│   │   ├── hosts.yml           # KNOWN VMs (maintenance runs)
+│   │   ├── provisioning.yml    # localhost + EMPTY provisioned group (deploy flow;
+│   │   │                       # filled at runtime by add_host)
 │   │   └── group_vars/
 │   │       └── provisioned.yml # storage layout + Phase 3 agent knobs: ONE file, five playbooks
 │   └── playbooks/
+│       ├── 00_provision_vm.yml # Phase 4: Ansible-native clone+cloud-init+disks
+│       ├── deploy_vm.yml       # Phase 4: THE entry point (Semaphore runs this)
 │       ├── 01_first_contact.yml
 │       ├── 02_storage.yml      # serial disks -> LVM -> XFS -> fstab
 │       ├── 03_storage_verify.yml  # reboot + prove boot persistence
 │       ├── 04_zabbix_agent.yml    # Zabbix Agent 2: pinned repo + verification ladder
 │       ├── 05_rsyslog_forward.yml # rsyslog -> TCP forward with disk queue (QRadar pattern)
 │       ├── 06_security_agents.yml # Trend/ManageEngine stub installers, marker contract
-│       └── templates/             # the series' first Jinja2 templates
+│       ├── 07_delivery_check.yml  # Phase 4: the handover gate
+│       ├── vars/                   # profiles.yml + lab-environment.yml (Phase 4)
+│       └── templates/              # the series' first Jinja2 templates
+├── semaphore/                 # Phase 4: UI wiring reference
+│   ├── README.md              # survey design + object wiring + security notes
+│   └── env/proxmox.env.example # the four PROXMOX_* variables (paste into UI)
 ├── scripts/
 │   ├── pve-bootstrap.sh        # API user + token (run on a PVE node)
-│   └── check-cpu-v3.sh         # x86-64-v3 feature check (run on host)
+│   ├── check-cpu-v3.sh         # x86-64-v3 feature check (run on host)
+│   ├── create-sem-01.sh        # Phase 4: LXC 901 (run on pve-a)
+│   └── sem-01-setup.sh         # Phase 4: Semaphore+Ansible inside sem-01
 ├── docs/
 │   ├── phase-1-guide.pdf       # step-by-step field guide (Phase 1)
 │   ├── phase-2-guide.pdf       # serial disks + LVM/XFS + resize chain (Phase 2)
-│   └── phase-2-addendum-guide.pdf  # group_vars + verify playbook + growth
-│   └── phase-3-agents-guide.pdf    # agent layer: Zabbix Agent 2, rsyslog, stubs
+│   ├── phase-2-addendum-guide.pdf  # group_vars + verify playbook + growth
+│   ├── phase-3-agents-guide.pdf    # agent layer: Zabbix Agent 2, rsyslog, stubs
+│   └── phase-4-semaphore-guide.pdf # delivery pipeline: form -> VM -> receipt
 └── README.md
 ```
 
@@ -239,6 +285,36 @@ ansible-playbook playbooks/06_security_agents.yml # ok=8 changed=3, re-run ok=8 
 #     universe has no zabbix-get, add the official 7.0 repo first):
 sudo apt-get install -y zabbix-get && zabbix_get -s 192.168.122.50 -k agent.version
 #     -> 7.0.30
+
+# 13. Phase 4: the delivery pipeline. Semaphore UI on its own LXC
+#     (full walkthrough: docs/phase-4-semaphore-guide.pdf):
+#     a) on pve-a: create the container and install everything in it:
+bash scripts/create-sem-01.sh          # -> Semaphore at http://192.168.122.21:3000
+#     b) on ctrl-01: host the repo for Semaphore (git over SSH):
+useradd -m -s /usr/bin/git-shell git && mkdir -p /srv/git
+git init --bare --initial-branch=main /srv/git/proxmox-automation.git
+# authorize sem-01's deploy key (printed by sem-01-setup.sh step 7):
+DEPLOY_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICaUb7zvNq8LGILOM96t9LeOBVjLjXuHnrydb+0k6fdU semaphore@sem-01"
+echo "$DEPLOY_KEY" > /home/git/.ssh/authorized_keys
+chown git:git /home/git/.ssh/authorized_keys && chmod 600 /home/git/.ssh/authorized_keys
+# refresh the working copy from the CURRENT zip, then publish
+# (plain `git init` still defaults to master - hence -b main; the
+# bare repo and every Semaphore object expect main):
+#   cd /root/proxmox-automation
+#   git init -b main && git add -A && git commit -m "phase 4"
+#   git push /srv/git/proxmox-automation.git main
+#   chown -R git:git /srv/git/proxmox-automation.git
+#   git config --global --add safe.directory /srv/git/proxmox-automation.git
+#     c) in Semaphore (sem-01:3000): project -> Key Store / Repository /
+#        Inventory / Environment / Task Template, survey variables per
+#        semaphore/README.md, then fill the form once and press Run.
+#     d) or CLI-first, no UI, same pipeline (lab smoke test, small disks):
+cd ansible && ansible-playbook -i inventory/provisioning.yml playbooks/deploy_vm.yml \
+  -e vm_profile=custom -e vm_hostname=vm-faz4-01 -e vm_ip=192.168.122.60 \
+  -e vm_vcpu=2 -e vm_ram_gb=4 \
+  -e 'vm_disks=[{"role":"data","size_gb":10}]'
+#     the run ends with the 07 delivery receipt; the receiver-side proof:
+#     grep faz4-vm-faz4-01 /tmp/qradar-stub.log   (on ctrl-01)
 ```
 
 ## Key design decisions
@@ -262,6 +338,14 @@ sudo apt-get install -y zabbix-get && zabbix_get -s 192.168.122.50 -k agent.vers
 | Data disk sizes are tfvars, not template properties | The golden template stays lean; per-VM sizes come from the request form (Phase 4) |
 | Lab mounts under `/srv/*` | Production DB pattern mounts `/var /log /data /backup`; mounting a fresh FS over a **live** `/var` needs an rsync migration first - noted, deliberately out of lab scope |
 | Grow-only storage (`lvol shrink: false`) | The provider hard-errors on disk shrink and XFS cannot shrink; the playbook matches that reality instead of fighting it |
+| Ansible-native provisioning, Terraform retired (Phase 4) | No state file to reconcile with VMs that live and die outside the pipeline; `community.proxmox` 2.0.0 covers clone + specs + serial disks natively |
+| Clone and configure are TWO tasks (`proxmox_kvm`) | In the module's clone branch only format/full/pool/snapname/storage/target reach the API - spec params passed alongside `clone` are silently dropped; specs go in via a follow-up `update: true` (with `update_unsafe: true`, else `net`/`ide` are skipped) |
+| Playbook-level "VM exists?" guard (`proxmox_vm_info`) | The module's clone mode does not check the target NAME (a re-run would clone again under the next free VMID); the guard makes the whole chain re-runnable |
+| `ide2: <storage>:cloudinit` on the clone | The Phase 1 template has no cloud-init drive (initialization lived on the workload); the Ansible path creates it explicitly, and ipconfig/sshkeys/ciuser render into it |
+| Semaphore over AWX (and over a custom UI) | AWX's last stable release is 24.6.1 (Jul 2024, releases paused); Semaphore ships weekly and its typed survey covers the whole request form; a custom UI would be another system to own |
+| Survey enums for vCPU/RAM, derived serials | The form can only offer what the pipeline allows; serials/VGs/LVs/mounts are derived from the role, never typed by a human |
+| SQLite dialect for Semaphore | The project's own default: no database server to run in the LXC; Postgres is an env-var switch if HA/remote runners arrive |
+| Every request re-validated by asserts | Forms are UX; `--extra-vars` and the API bypass them - the playbook is the gate |
 | Storage layout in `group_vars/provisioned.yml`, not playbook `vars:` | One list feeds the build (02) and the verify (03) playbooks; `--extra-vars` can still override for experiments |
 | Verify playbook reboots by design (`03_storage_verify.yml`) | fstab entries and LVM activation only prove themselves at boot; "should survive" is a weaker claim than "verified to survive" |
 | Fifth disk opt-in via `scratch_disk_size_gb = 0` + dynamic block | Growth stays declarative: the knob removes the disk block entirely when unused; mounting it is an Ansible-side concern (group_vars entry) |
@@ -299,6 +383,18 @@ Field-tested failures and their root causes:
 | A server's Zabbix polls time out although 04 is green | `Server=` does not list the polling host; the agent silently drops untrusted polls | add the IP to `zabbix_agent_server` (comma-separated list), or poll from ctrl-01 with `zabbix-get` |
 | 03_storage_verify.yml reboots the VM | By design: that is the test (boot persistence) | Add `-e verify_reboot=false` for a no-downtime check (marker test becomes same-session) |
 | `03_storage_verify.yml`: `data_disks is not defined` | Play ran outside the repo's ansible.cfg / inventory, so `group_vars/provisioned.yml` was not loaded | Run from `ansible/` with the repo's `ansible.cfg`, or point `-i inventory/hosts.yml` explicitly |
+| `sem-01-setup.sh` stops before step 1/8 after `tr: write error: Broken pipe` (field-found on sem-01, 28 Aug 2026) | `tr ... | head -c 16` under `set -euo pipefail`: head closes the pipe after 16 bytes, tr dies, pipefail aborts the script through the command substitution; the sandbox missed it because it passed the password as an argument | fixed in the script (head reads a bounded block first, cut trims last); workaround on an already-pushed copy: pass the password as the script's first argument |
+| `ansible-galaxy` / `ansible-playbook` inside sem-01 dies with `Ansible could not initialize the preferred locale: unsupported locale setting` (field-found on sem-01, 28 Aug 2026) | `pct exec` inherits the calling shell's `LANG=en_US.UTF-8`, which the minimal LXC has not generated; ansible-core refuses an invalid locale (the perl locale warnings in the same output are the cosmetic cousin) | fixed in the script (exports `LANG=C.UTF-8`, installs `locales`, runs `locale-gen en_US.UTF-8`); ad-hoc fix: `pct exec 901 -- env LANG=C.UTF-8 <command>` or generate the locale once inside the CT |
+| `journalctl -u semaphore` shows `Cannot Find configuration! Use --config parameter to point to a JSON or YAML file` and the unit loops on `activating (auto-restart)` (field-found on sem-01, 28 Aug 2026; restart counter 445 after one hour) | the message is the binary's catch-all for an UNREADABLE config, not only a missing one: root-created state meets a non-root unit. The migrations and admin creation ran as root so `semaphore.db` is root-owned, and `config.json` is 640 root:root; the `User=semaphore` unit can read neither. The sandbox validation ran the binary directly as its own user and never exercised the unit's identity | fixed in the script (config chgrp'd to the service user; data dir chown'd recursively after the migrations); ad-hoc fix: `pct exec 901 -- bash -c 'chown root:semaphore /etc/semaphore/config.json; chown -R semaphore:semaphore /var/lib/semaphore; systemctl restart semaphore'` |
+| `ansible-galaxy collection install` inside sem-01 answers "Nothing to do. All requested collections are already installed" although community.proxmox 2.0.0 is absent | Ubuntu's `ansible` package bundles older collections (community.proxmox 1.4.0 and friends) in the system path; an unpinned bare name lets galaxy consider the requirement satisfied by them | `requirements.yml` pins `community.proxmox >= 2.0.0`; the semaphore user's `~/.ansible/collections` also wins the runtime search order, which is where `--force` (or the pinned re-run) puts 2.0.0 |
+| First sign-in shows "Failed to create session"; dev tools show POST `/api/auth/login` answering HTTP 500 (field-found on sem-01, 28 Aug 2026, fourth bug of the same install) | v2.19 signs session cookies and requires two secrets in config.json: `cookie_hash` and `cookie_encryption` (the pre-2.19 names `cookie_hash_key`/`cookie_encryption_key` still in blogs do NOT work; the json tags were read from the binary). The server starts, the form renders, bcrypt passes - then cookie encoding fails. The sandbox validated HTTP 200 but never exercised the login endpoint | fixed in the script (config written with both keys generated via pipefail-safe `od -N`); ad-hoc fix: generate two values, rewrite config.json with `"cookie_hash": "<64 hex>"` + `"cookie_encryption": "<32 hex>"`, keep 640 root:semaphore ownership, `systemctl restart semaphore` |
+| `git push /srv/git/proxmox-automation.git main` answers `error: src refspec main does not match any` (field-found on ctrl-01, 28 Aug 2026; guide errata) | plain `git init` still defaults to branch `master` (the default changes only in Git 3.0); the bare repo, the push command, and the Semaphore repository object all say `main` | on the already-committed copy: `git branch -m master main`, then push; the corrected guide ch. 4 and this quick start use `git init -b main` from the start |
+| `authorized_keys` ends up empty (a later clone from sem-01 answers `Permission denied (publickey)`); copy-pasting the original guide block also produced `chmod: missing operand` (field-found on ctrl-01, 28 Aug 2026; guide errata) | two errata in the original guide ch. 4 block: the `<sem-01 deploy public key>` placeholder was silently eaten by the PDF renderer (the guide library's `esc()` escaped nothing, and the parser treats `<word>` as markup), and the 89-char `chown ... && chmod ...` line wrapped across two PDF lines, so the pasted `chmod` ran without its operand | fixed in this edition (the real deploy key is written into the block, every line stays short enough not to wrap, `esc()` escapes for real); ad-hoc on an existing box: `echo "<deploy key>" > /home/git/.ssh/authorized_keys`, then `chown` and `chmod` as separate lines |
+| first clone/pull from sem-01 answers `fatal: detected dubious ownership in repository at '/srv/git/proxmox-automation.git'` | git (>= 2.35.2, CVE-2022-24765) refuses to serve a repository owned by a different user: the bare repo was created by root, the SSH side runs as `git` | `chown -R git:git /srv/git/proxmox-automation.git`; root's local-path push keeps working via `git config --global --add safe.directory /srv/git/proxmox-automation.git` |
+| Semaphore run hangs ~5 min at 01's "Wait for any lingering apt/dpkg activity" and fails with `stdout: ["unattended-upgr"]` after every retry (field-found, run #30, 29 Aug 2026) | the gate matched process NAMES, but on Ubuntu 26.04 `unattended-upgr` is the PERMANENT unattended-upgrades.service daemon that never leaves `ps` - all 60 samples saw only the idle daemon and zero apt/dpkg workers, so the loop could never clear | gate v3 is lock-based: `fuser` on the dpkg/apt locks plus `systemctl is-active apt-daily(.upgrade)`; name matching is demoted to a fuser-less fallback that deliberately excludes the daemon; busy polls print the reason; window 90x10 s |
+| Re-running the deploy on an EXISTING running VM: "Apply the VM specification" succeeds in ~3 s but "Wait for SSH" then times out for the full 600 s (field-found, run #32, 29 Aug 2026; reproducible on every adoption, never on fresh clones) | the apply task resubmits `net0` WITHOUT a macaddr, so PVE regenerates the MAC and hot-replaces the NIC on the running VM; the guest KEEPS its IP (field probes: ping answered, guest agent answered, sshd listening) but the controller's SSH path breaks | the lookup task now extracts the existing MAC from `config.net0` and the apply pins it with `macaddr=`; fresh clones are unchanged; with the pin the same adoption path passed in ~10 s (run #36) |
+| Deploy run dies in 04's pre-task assert: `zabbix_agent_version is undefined`, although static CLI runs of the same plays pass (field-found, run #31, 29 Aug 2026) | Semaphore runs ansible with its OWN generated inventory, so the repo's `inventory/group_vars/provisioned.yml` never loads on the deploy path; add_host hostvars (data_disks) DO arrive - which is why 01-03 passed - but group-scope agent vars do not | agent layer moved to `ansible/playbooks/vars/agent-layer.yml`, loaded by plays 04/05/06/07 via `vars_files` (the same pattern 00 already used for profiles); group_vars keeps storage only; one source of truth for both run modes |
+| 04 dies at "Add the pinned Zabbix apt repository" with `Unsupported parameters for (ansible.builtin.apt_repository) module: lock_timeout` (field-found, run #36, 29 Aug 2026) | the earlier dpkg-lock hardening added `lock_timeout: 1800` to all five apt call sites - but only `apt` accepts it (core 2.12+); `apt_repository` rejects it during module argument validation. Latent because no pipeline run had ever reached this task before | parameter removed from the `apt_repository` task only (the four real `apt` sites keep it); the v3 lock-based gate included just above already cleared the race |
 
 ## Roadmap
 
@@ -307,7 +403,7 @@ Field-tested failures and their root causes:
 | 1 | Golden template + Terraform clone + cloud-init + first contact | **done, field-verified** (guide: `docs/phase-1-guide.pdf`) |
 | 2 | Multi-disk via disk `serial` attribute, LVM + XFS, online resize chain | **done, field-verified end to end, closed** (guide: `docs/phase-2-guide.pdf`; addendum edition 3: `docs/phase-2-addendum-guide.pdf` - group_vars + verify + growth all field-run; growth: 02 `ok=15 changed=5`, 03 `ok=28 changed=2 failed=0` with every device letter rotated at boot) |
 | 3 | Agent roles: Zabbix Agent 2, Trend Micro, ManageEngine, rsyslog to QRadar | **done, field-verified end to end, closed** (guide edition 2: `docs/phase-3-agents-guide.pdf`; every runbook step green 28 Aug 2026 - 04 `ok=19 changed=5`, 05 `ok=13 changed=3`, 06 `ok=8 changed=3`, all re-runs clean, `zabbix_get` answered 7.0.30; an accidental receiver outage proved the disk queue: 193 KB survived an rsyslog restart, 942 lines late-delivered with original timestamps) |
-| 4 | Semaphore UI form-driven pipeline, dynamic inventory, phone_home | planned |
+| 4 | Request form: Semaphore UI on its own LXC, Ansible-native provisioning (Terraform retired), delivery gate | **done, field-verified end to end, closed** (guide: `docs/phase-4-semaphore-guide.pdf`; first full pipeline green 29 Aug 2026 - Semaphore form to delivery-checked VM: clone and adopt with a pinned MAC, guest agent, data01 storage stack, zabbix-agent2, rsyslog forward with the receiver-side receipt in hand, stub markers, delivery gate all green; four install-time field bugs fixed en route as in phase 3's story, then four pipeline findings closed the loop: the name-based apt gate, adoption MAC regeneration, the Semaphore inventory never loading group_vars, and an apt_repository parameter overreach) |
 | 5 | Scale hardening: IPAM, parallelism limits, drift detection | planned |
 
 ## Notes for production

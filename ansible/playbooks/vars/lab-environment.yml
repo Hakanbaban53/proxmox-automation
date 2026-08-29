@@ -1,0 +1,60 @@
+---
+# Phase 4: the lab environment this pipeline deploys into.
+#
+# Everything here is a DEFAULT with three override levels (highest wins):
+#   1. --extra-vars (and Semaphore survey values, which arrive the same way)
+#   2. environment variables - only the four PROXMOX_* secrets read env
+#      vars, so Semaphore's Environment can hold the token without it
+#      ever living in git (see semaphore/env/proxmox.env.example)
+#   3. this file
+#
+# Values below mirror the field-proven terraform.tfvars the lab ran with
+# through Phases 1-3 (template 9000, nfs-shared, vmbr0, .1 gateway).
+
+# ---- Proxmox API (the only secrets; env vars win over these defaults) ----
+# NOTE (field finding #8, 29 Aug 2026): Semaphore >= 2.19 delivers Variable
+# Group JSON values to Ansible as EXTRA-VARS, not as process environment
+# variables (the old Environment behavior). The token_secret line therefore
+# reads BOTH sources: env var first (CLI exports, Secrets-tab entries), then
+# an extra-var of the same name (Variable Group JSON). Either semantics feeds
+# the pipeline; neither puts the token in git.
+proxmox_api_host: "{{ lookup('env', 'PROXMOX_HOST') | default('192.168.122.11', true) }}"
+proxmox_api_user: "{{ lookup('env', 'PROXMOX_USER') | default('terraform@pve', true) }}"
+proxmox_api_token_id: "{{ lookup('env', 'PROXMOX_TOKEN_ID') | default('provider', true) }}"
+proxmox_api_token_secret: "{{ lookup('env', 'PROXMOX_TOKEN_SECRET') or PROXMOX_TOKEN_SECRET | default('', true) }}"
+proxmox_api_port: "{{ lookup('env', 'PROXMOX_PORT') | default('8006', true) }}"
+# Self-signed PVE certificates in the lab; set true once a real CA signs them.
+proxmox_validate_certs: false
+
+# ---- Where the golden template lives ------------------------------------
+proxmox_node: pve-a
+proxmox_template_name: ubuntu-2604-tpl
+proxmox_template_vmid: 9000
+proxmox_storage: nfs-shared
+# The cloud-init drive (ide2) deliberately does NOT live on proxmox_storage:
+# ISO regeneration at VM start writes to this image, and on NFS that write
+# hangs deterministically in this lab (field finding #11: qm start stuck at
+# "generating cloud-init ISO" for 300+ s, twice, VM never booted). The ISO is
+# a few MB and lock-sensitive - local storage is the right home for it.
+proxmox_cloudinit_storage: local-lvm   # adjust to pve-a's real local storage (pvesm status)
+
+# Per-VM vCPU cap pve-a enforces at START time only (finding #12: qm set
+# accepts anything, qm start answers "MAX 2 vcpus"). The spec assert in
+# 00_provision_vm.yml checks this before the clone spends minutes.
+vm_max_vcpu: 2
+
+# ---- Guest networking ----------------------------------------------------
+vm_bridge: vmbr0
+vm_ip_cidr: 24
+vm_ip_gateway: 192.168.122.1
+vm_dns_servers: ["192.168.122.1", "1.1.1.1"]
+vm_search_domains: ["lab.local"]
+vm_username: ubuntu
+
+# The SSH keypair this control node uses to reach freshly cloned VMs.
+# cloud-injects the public half (see 00_provision_vm.yml), logs in with
+# the private half. On ctrl-01 and on sem-01 (Semaphore's service user)
+# the default is the same path, so the pipeline is location-independent.
+deploy_ssh_key_dir: "{{ lookup('env', 'HOME') }}/.ssh"
+deploy_ssh_public_key_path: "{{ deploy_ssh_key_dir }}/id_ed25519.pub"
+deploy_ssh_private_key_path: "{{ deploy_ssh_key_dir }}/id_ed25519"

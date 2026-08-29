@@ -43,6 +43,13 @@
   become: true
   gather_facts: true
 
+  vars_files:
+    # Deploy runs go through Semaphore's own inventory, where the repo's
+    # group_vars never load (field finding #18, run #31): the play carries
+    # its agent-layer settings itself. Static runs load the same file -
+    # one source of truth for both modes.
+    - vars/agent-layer.yml
+
   pre_tasks:
     - name: Require the agent list and validate the marker contract inputs
       ansible.builtin.assert:
@@ -56,12 +63,11 @@
              == security_agents | length
         fail_msg: >-
           security_agents is missing or invalid. It lives in
-          ansible/inventory/group_vars/provisioned.yml (Phase 3
-          section). Every entry needs name, display_name, mode,
-          version and an ABSOLUTE install_dir; names must be unique;
-          and mode must be 'stub' - 'real' is reserved for licensed
-          installers that are not wired in yet (the guide's chapter 4
-          has the swap-in runbook).
+          ansible/playbooks/vars/agent-layer.yml. Every entry needs name,
+          display_name, mode, version and an ABSOLUTE install_dir; names
+          must be unique; and mode must be 'stub' - 'real' is reserved for
+          licensed installers that are not wired in yet (the guide's
+          chapter 4 has the swap-in runbook).
 
   tasks:
     # ------------------------------------------------------------------

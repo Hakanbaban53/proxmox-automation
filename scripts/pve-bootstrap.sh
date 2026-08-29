@@ -14,8 +14,12 @@ PVE_USER="terraform@pve"
 PVE_TOKEN_NAME="provider"
 TOKEN_ID="${PVE_USER}!${PVE_TOKEN_NAME}"
 
-# 1. Dedicated user (idempotent)
-if pveum user list | awk '{print $1}' | grep -qx "$PVE_USER"; then
+# 1. Dedicated user (idempotent). NOTE (field finding #15): pveum list
+# output is version-dependent (PVE 9.x may draw table borders), so the
+# original awk+$1 | grep -x guard missed an EXISTING user and the script
+# died at pveum user add "already exists". Matching the userid as a WORD
+# (grep -w) is format-agnostic: plain, bordered or json output all match.
+if pveum user list | grep -qw "$PVE_USER"; then
   echo "[ok] user $PVE_USER already exists"
 else
   pveum user add "$PVE_USER" --comment "Terraform automation (proxmox-automation repo)"
@@ -26,11 +30,14 @@ fi
 pveum acl modify / --users "$PVE_USER" --roles Administrator
 echo "[ok] Administrator role granted on /"
 
-# 3. API token (idempotent - value is only shown at creation time)
-if pveum user token list "$PVE_USER" 2>/dev/null | awk '{print $1}' | grep -qx "$PVE_TOKEN_NAME"; then
+# 3. API token (idempotent - value is only shown at creation time).
+# Same word-match fix as step 1 (field finding #15).
+if pveum user token list "$PVE_USER" | grep -qw "$PVE_TOKEN_NAME"; then
   echo "[ok] token $TOKEN_ID already exists"
   echo "    value is only displayed at creation time."
-  echo "    to rotate it:  pveum user token remove $PVE_USER $PVE_TOKEN_NAME  && re-run this script"
+  echo "    to rotate it:"
+  echo "      pveum user token remove $PVE_USER $PVE_TOKEN_NAME"
+  echo "      pveum user token add  $PVE_USER $PVE_TOKEN_NAME --privsep 0"
 else
   echo "[+] creating token $TOKEN_ID"
   pveum user token add "$PVE_USER" "$PVE_TOKEN_NAME" --privsep 0 --comment "bpg/proxmox provider token"

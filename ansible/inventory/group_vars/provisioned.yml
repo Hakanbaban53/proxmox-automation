@@ -45,54 +45,15 @@ data_disks:
 verify_reboot: true
 
 # =========================================================================
-# Phase 3: the agent layer (04/05/06 all read this section).
+# Phase 3: the agent layer (04/05/06 + the 07 delivery gate).
 # =========================================================================
-# Lab story: ctrl-01 (192.168.122.10) stands in for BOTH central systems,
-# the monitoring server and the log receiver. Point these at the real
-# ones when they exist; the playbooks change nothing else.
-
-# ---- 04_zabbix_agent.yml -----------------------------------------------
-# Repo pin: Zabbix 7.0 LTS. Live-checked Aug 2026: 7.0 publishes an
-# Ubuntu 26.04 (resolute) section; 8.0/8.2 do not yet. Ubuntu universe
-# also ships zabbix-agent2 (7.0.22); with the official repo added, apt
-# elects the newer 7.0.30 from repo.zabbix.com - the playbook asserts
-# that election every run.
-zabbix_agent_version: "7.0"
-zabbix_agent_server: "192.168.122.10"        # passive checks come FROM here
-zabbix_agent_serveractive: "192.168.122.10"  # active checks go TO here
-zabbix_agent_listenport: 10050
-zabbix_agent_hostname: "{{ inventory_hostname }}"
-
-# ---- 05_rsyslog_forward.yml --------------------------------------------
-# QRadar pattern: forward everything over TCP with a disk-assisted
-# queue. The lab receiver is a socat one-liner on ctrl-01 (guide
-# chapter 3); it listens on 5514, an UNPRIVILEGED port, so the lab
-# needs no root daemon. Run it under nohup so it survives its SSH
-# session - the 28 Aug 2026 field run lost a receiver that way and
-# the disk queue had to prove itself (guide ch3, the outage that ran
-# itself). Production QRadar listens on 514 - change this one var
-# and re-run.
-rsyslog_receiver_host: "192.168.122.10"
-rsyslog_receiver_port: 5514
-rsyslog_forward_protocol: tcp        # tcp (QRadar-style) or udp
-rsyslog_queue_maxdisk: "100m"        # on-disk buffer while the receiver is down
-rsyslog_test_tag: "phase3-test"      # smoke-test tag the playbook emits
-
-# ---- 06_security_agents.yml --------------------------------------------
-# Stub installers: the harness is real (directories, script, marker,
-# verification), the payload is an echo. mode: real is reserved for
-# licensed installers and intentionally fails the guard until one is
-# wired in (guide chapter 4 has the swap-in runbook). Bumping version
-# makes the marker assert fail ON PURPOSE: old marker + new desired
-# version is drift, and drift should be loud.
-security_agents:
-  - name: trendmicro
-    display_name: Trend Micro Deep Security Agent
-    mode: stub
-    version: "1.0.0-stub"
-    install_dir: /opt/TrendMicro
-  - name: manageengine
-    display_name: ManageEngine EventLog Analyzer Agent
-    mode: stub
-    version: "1.0.0-stub"
-    install_dir: /opt/ManageEngine
+# MOVED to ansible/playbooks/vars/agent-layer.yml (field finding #18,
+# 29 Aug 2026): Semaphore runs ansible with its OWN generated inventory,
+# so this group_vars directory never loads on the deploy path - run #31
+# passed 01-03 (their inputs ride along as add_host hostvars) and died
+# in 04's pre-task assert with zabbix_agent_version undefined, while the
+# same plays passed in static CLI runs against the repo inventory. The
+# plays now carry the file themselves via vars_files: one source of
+# truth for both run modes. Storage (data_disks above) stays HERE -
+# static runs read it from this file, deploy runs get it as an add_host
+# hostvar from 00_provision_vm.yml.

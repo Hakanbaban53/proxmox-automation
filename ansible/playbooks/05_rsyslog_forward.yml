@@ -59,8 +59,15 @@
   become: true
   gather_facts: true
 
+  vars_files:
+    # Deploy runs go through Semaphore's own inventory, where the repo's
+    # group_vars never load (field finding #18, run #31): the play carries
+    # its agent-layer settings itself. Static runs load the same file -
+    # one source of truth for both modes.
+    - vars/agent-layer.yml
+
   pre_tasks:
-    - name: Require the forwarding settings (group_vars/provisioned.yml)
+    - name: Require the forwarding settings (vars/agent-layer.yml)
       ansible.builtin.assert:
         that:
           - rsyslog_receiver_host is defined and rsyslog_receiver_host | length > 0
@@ -72,9 +79,9 @@
         fail_msg: >-
           The rsyslog_forward settings are not defined or the protocol
           is not tcp/udp. They live in
-          ansible/inventory/group_vars/provisioned.yml (Phase 3
-          section); check that the file exists and that the play is
-          running against the `provisioned` group with the
+          ansible/playbooks/vars/agent-layer.yml, loaded by this play's
+          vars_files (field finding #18); for a static run, check the
+          play is running against the `provisioned` group with the
           repository's ansible.cfg.
 
   handlers:
@@ -84,10 +91,14 @@
         state: restarted
 
   tasks:
+    - name: Wait out the first-boot apt race before touching packages
+      ansible.builtin.include_tasks: tasks/wait_for_apt.yml
+
     - name: Install rsyslog if absent (the resolute image ships it)
       ansible.builtin.apt:
         name: rsyslog
         state: present
+        lock_timeout: 1800
 
     - name: Ensure the queue spool directory exists
       ansible.builtin.file:

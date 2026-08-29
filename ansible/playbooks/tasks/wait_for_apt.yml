@@ -1,0 +1,52 @@
+---
+# v3: field finding #16 (run #30). The v2 straggler loop matched process
+# NAMES, but on Ubuntu 26.04 `unattended-upgr` is a PERMANENT systemd
+# daemon (unattended-upgrades.service, "Unattended Upgrades Shutdown")
+# that never leaves the process table - 60/60 retries saw only the idle
+# daemon and zero apt/dpkg workers, so the loop could never clear.
+# v3 gates on what actually blocks our apt calls instead:
+#   (a) dpkg/apt lock ownership (fuser), and
+#   (b) the boot-time apt oneshot units still running.
+# Name matching survives only as a fallback for boxes without fuser and
+# deliberately EXCLUDES the daemon. Second layer of defense stays at the
+# apt call sites: lock_timeout: 1800 everywhere (#14v2).
+- name: Wait for cloud-init to finish (its apt pass runs inside it)
+  ansible.builtin.command: timeout 1800 cloud-init status --wait
+  register: cloudinit_wait
+  changed_when: false
+  failed_when: false   # rc != 0 = error/disabled; the lock is free anyway
+
+- name: Report the cloud-init outcome (informational)
+  ansible.builtin.debug:
+    msg: >-
+      cloud-init rc={{ cloudinit_wait.rc }},
+      state: {{ (cloudinit_wait.stdout | default('') | trim) or 'no output' }}
+
+- name: Wait for any lingering apt/dpkg activity to clear (lock-based)
+  ansible.builtin.shell: |
+    why=''
+    # (a) the real gate: a process holding the dpkg/apt locks
+    if command -v fuser >/dev/null 2>&1; then
+      holders=$(fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+                      /var/lib/apt/lists/lock /var/cache/apt/archives/lock \
+                2>/dev/null || true)
+      if [ -n "$holders" ]; then why="apt lock held by pid:${holders}"; fi
+    else
+      # fallback without psmisc: transient apt workers only.
+      # NOTE: unattended-upgr is intentionally NOT matched here - it is
+      # the permanent unattended-upgrades daemon, not apt activity.
+      if ps -eo comm= | grep -E '^(apt|dpkg)' >/dev/null; then
+        why='apt/dpkg worker process present'
+      fi
+    fi
+    # (b) boot-time apt oneshots (apt-daily / apt-daily-upgrade)
+    st=$(systemctl is-active apt-daily.service apt-daily-upgrade.service 2>/dev/null || true)
+    if printf '%s\n' "$st" | grep -qE '^(active|activating|reloading)'; then
+      why="${why:+$why; }apt-daily unit still active (${st})"
+    fi
+    if [ -n "$why" ]; then echo "BUSY: $why"; else echo IDLE; fi
+  register: apt_boot_activity
+  changed_when: false
+  until: apt_boot_activity.stdout == 'IDLE'
+  retries: 90
+  delay: 10

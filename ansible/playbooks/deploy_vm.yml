@@ -1,0 +1,36 @@
+---
+# Phase 4: the deploy pipeline - ONE entry point for Semaphore (or CLI).
+#
+# The Semaphore task template runs exactly this file; a CLI run is the
+# same pipeline with -e instead of the survey form:
+#
+#   ansible-playbook -i inventory/provisioning.yml playbooks/deploy_vm.yml \
+#     -e vm_profile=web-small -e vm_hostname=vm-web-01 -e vm_ip=192.168.122.61
+#
+# Chain (each import is a Phase 1-3 playbook, unchanged in spirit):
+#   00  provision on the Proxmox API, register the VM in `provisioned`
+#   01  first contact: guest agent, identity marker
+#   02  storage: serial -> PV/VG/LV/XFS/mount (skips itself when no disks)
+#   04  Zabbix Agent 2
+#   05  rsyslog -> QRadar pattern (disk-assisted queue, smoke test)
+#   06  security agents (stub installer / marker contract)
+#   07  delivery checklist - the handover gate
+#
+# Deliberately NOT in the chain:
+#   03_storage_verify.yml - it REBOOTS the VM to prove fstab/LVM survive a
+#   boot. It stays a separate, on-demand run (its own Semaphore template
+#   or CLI), because a reboot in the middle of every deploy would double
+#   delivery time for no daily value.
+#
+# Terraform heritage: vm.tf produced the same artifacts (clone, specs,
+# cloud-init, serial disks) through Phases 1-3. 00_provision_vm.yml now
+# produces them with community.proxmox alone - no state file, no drift
+# between pipeline-managed and externally-deleted VMs. The terraform/
+# directory stays in the repo, retired but runnable, for reference.
+- import_playbook: 00_provision_vm.yml
+- import_playbook: 01_first_contact.yml
+- import_playbook: 02_storage.yml
+- import_playbook: 04_zabbix_agent.yml
+- import_playbook: 05_rsyslog_forward.yml
+- import_playbook: 06_security_agents.yml
+- import_playbook: 07_delivery_check.yml

@@ -1,0 +1,22 @@
+---
+# Phase 4 deploy-flow inventory.
+#
+# Semaphore runs the deploy pipeline with an inventory whose content is
+# EXACTLY this file (pasted into a Semaphore Inventory object), and a CLI
+# run uses the file directly:
+#   ansible-playbook -i inventory/provisioning.yml playbooks/deploy_vm.yml -e ...
+#
+# The two groups:
+#   (implicit) localhost - play 00 runs here, connection: local, and talks
+#                to Proxmox over the API (never SSH).
+#   provisioned         - EMPTY on purpose. 00_provision_vm.yml add_host's
+#                the freshly cloned VM into it at runtime, and plays 01-07
+#                target the group. The group must exist in the inventory
+#                (even empty) for inventory/group_vars/provisioned.yml -
+#                the agent settings - to load for the added host.
+#
+# hosts.yml (vm-test-01 and friends) remains the inventory for direct
+# maintenance runs against KNOWN VMs; the two files do not mix.
+all:
+  children:
+    provisioned: {}
