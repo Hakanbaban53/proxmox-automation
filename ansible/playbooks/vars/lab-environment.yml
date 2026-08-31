@@ -43,6 +43,52 @@ proxmox_cloudinit_storage: local-lvm   # adjust to pve-a's real local storage (p
 # 00_provision_vm.yml checks this before the clone spends minutes.
 vm_max_vcpu: 2
 
+# ---- Phase 5a: the fleet admission budget --------------------------------
+# The admission gates in 00_provision_vm.yml (section 2b) refuse a request
+# BEFORE the clone when adding it would push the ALLOCATED (not used)
+# vCPU/RAM of all non-template qemu VMs past these numbers. Deliberately
+# below the node's physical ceiling: the budget leaves headroom for the
+# CTs (ctrl-01, sem-01) and the laptop host itself. Tune to your hardware;
+# a refusal prints the full math, so a wrong budget announces itself.
+# Scope: qemu VMs only - templates and CTs are infrastructure, not fleet
+# budget (see the exclusion comments in 00 section 2b).
+capacity_max_vcpu: 8
+capacity_max_ram_gb: 16
+
+# ---- Phase 5b: the health audit (08_health_audit.yml) ---------------------
+# The audit is READ-ONLY on the cluster and the guests; the only file it
+# touches is its own baseline (a snapshot of the managed fleet from the
+# previous run - the drift reference and the only memory of deleted VMs).
+# It lives on the RUNNER so it survives between Semaphore runs: the HOME
+# env var decides where. On sem-01 the service passes HOME=/home/semaphore
+# to its tasks (field-proven 30 Aug 2026: the first audit wrote its
+# baseline there; USER is absent from the task env, which is why the
+# digest signs "unknown@sem-01"), and CLI runs from ctrl-01's root land
+# under /root. Run the SCHEDULED audit from ONE place (sem-01) or the
+# baselines diverge.
+audit_baseline_dir: "{{ lookup('env', 'HOME') | default('/root', true) }}/proxmox-audit-baseline"
+audit_fs_warn_pct: 80          # guest filesystem usage that deserves a WARN line
+audit_node_mem_warn_pct: 85    # node memory pressure threshold
+audit_node_cpu_warn_pct: 90    # node CPU pressure threshold
+audit_guest_services:          # the services every managed VM owes the fleet
+  - zabbix-agent2
+  - rsyslog
+  - qemu-guest-agent
+
+# The mail digest: the playbook prints the digest to the task log ALWAYS
+# (mail-independent by design) and additionally mails it when the runner
+# has msmtp configured - see scripts/sem-01-msmtp.sh and the Phase 5b
+# section in semaphore/README.md (one-time setup on sem-01). The mail
+# SECRET (the Gmail app password) lives in /etc/msmtprc on the runner,
+# never in git; these two addresses only build the envelope.
+audit_mail_enabled: true
+audit_mail_from: "hakanismail53@gmail.com"   # must match the msmtp account on the runner
+audit_mail_to: ""    # RETIRED 30 Aug 2026: the Gmail app password was revoked after the
+                     # full mail chain was field-proven (inbox delivery observed); empty =
+                     # digest stays in the task log (graceful log-only mode, by design).
+                     # To re-arm: new app password via scripts/sem-01-msmtp.sh + set this
+                     # back to the recipient address.
+
 # ---- Guest networking ----------------------------------------------------
 vm_bridge: vmbr0
 vm_ip_cidr: 24

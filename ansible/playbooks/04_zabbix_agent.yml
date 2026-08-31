@@ -34,10 +34,12 @@
 #
 # Idempotency: repo file, key, package and config converge; only the
 # first run changes anything (field-run shape, chapter 5 of the guide,
-# 28 Aug 2026: ok=19 changed=5, re-run ok=18 changed=0; two of the
-# build-time predicted changes never happen because the resolute image
-# already ships /etc/apt/keyrings and apt's postinst starts+enables
-# the service itself). The config template
+# 28 Aug 2026 standalone: ok=19 changed=5, re-run ok=18 changed=0; two
+# of the build-time predicted changes never happen because the resolute
+# image already ships /etc/apt/keyrings and apt's postinst starts+enables
+# the service itself. First pipeline run, 29 Aug 2026 (run #37): the same
+# five changes inside deploy_vm.yml, folded into the guest's changed=11
+# with 05's three and 06's three). The config template
 # notifies a handler - the first handlers in this series - and
 # flush_handlers runs it BEFORE the verification tasks, so what gets
 # verified is the running agent, not a config file waiting for a
@@ -220,7 +222,7 @@
           The rendered /etc/zabbix/zabbix_agent2.conf does not contain
           the expected Server/ServerActive/Hostname lines. Diff it
           against ansible/playbooks/templates/zabbix_agent2.conf.j2 and
-          the Phase 3 section of group_vars/provisioned.yml.
+          ansible/playbooks/vars/agent-layer.yml (the knob source).
 
     - name: Receipt - agent on duty
       ansible.builtin.debug:

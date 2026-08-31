@@ -93,7 +93,9 @@
 
     - name: Emit the delivery test message (tag carries the hostname)
       ansible.builtin.command:
-        cmd: 'logger -t faz4-{{ inventory_hostname }} "delivery check {{ ansible_date_time.iso8601 }}"'
+        # ansible_facts[...] form: top-level ansible_date_time is deprecated
+        # (INJECT_FACTS_AS_VARS, removed in ansible-core 2.24).
+        cmd: 'logger -t faz4-{{ inventory_hostname }} "delivery check {{ ansible_facts["date_time"]["iso8601"] }}"'
       changed_when: false
 
     - name: The message must appear in the local log

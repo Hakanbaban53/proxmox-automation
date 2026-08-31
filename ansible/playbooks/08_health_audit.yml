@@ -1,0 +1,570 @@
+---
+# Phase 5b: the health audit - what the field asked for on 28 Aug:
+# "her sabah aksam proxmox saglik kontrolu + mail" (a morning/evening
+# Proxmox health check with a mail digest). It runs STANDALONE (it is
+# NOT chained into deploy_vm.yml): Semaphore schedules it, it looks,
+# it reports, and it mutates nothing except its own baseline file.
+#
+# Three plays:
+#   1. the API view (localhost): cluster quorum, node health, fleet
+#      budget, the pipeline-managed fleet, drift against the last
+#      audit's baseline, TCP/22 probes. Costs only the API token.
+#   2. the guest view (managed VMs over SSH, READ-ONLY): service
+#      states, filesystem usage, uptime. Never fatal - findings only
+#      (ignore_unreachable + failed_when false; an unreachable guest
+#      is a FINDING, not a dead audit).
+#   3. the digest (localhost): fold all findings together, print the
+#      digest to the task log FIRST (mail-independent by design - the
+#      mailbox can be broken while the log cannot), mail it via msmtp
+#      when the runner has one, refresh the baseline, and only then
+#      the verdict: the assert runs LAST so a red task always means
+#      the digest is already in the log (and the mail, if configured).
+#
+# The intent record, honestly (a design revision against the roadmap's
+# "registry" wording): the plan was to store deploy intent in each
+# VM's notes field - but community.proxmox 2.0.0's proxmox_kvm has NO
+# notes parameter (source-verified), so that vehicle is dead. The
+# audit keeps its OWN baseline instead: a snapshot of the managed
+# fleet taken by the previous run ({{ audit_baseline_file }}).
+# Drift = live vs last-audit. This is also the ONLY way to see a
+# DELETED managed VM - live state cannot remember what no longer
+# exists. A deploy between two audits shows up as a one-cycle
+# "changed" line: cosmetic, and the baseline refreshes itself at the
+# end of every run. Scope: only tag pipeline-managed VMs (the tag IS
+# the registry - set by play 00 at deploy time) - test machines like
+# the alpines are fleet numbers, not drift targets.
+#
+# Severity model:
+#   CRITICAL  quorum lost, node/CT down, managed VM deleted,
+#             budget exceeded by manual change
+#   WARN      managed VM stopped / onboot off / SSH unreachable /
+#             auth failed, service down, filesystem full, node
+#             memory/CPU pressure
+#   INFO      drift lines, new VMs, standalone-node note, template
+#             missing (breaks the NEXT deploy), mail not configured
+# The verdict assert fails on CRITICAL/WARN only: a red Semaphore
+# task means "a human should read the digest", nothing more.
+
+- name: Phase 5b - health audit, play 1 - the API view
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/lab-environment.yml
+
+  vars:
+    audit_findings: []       # [{sev: CRITICAL|WARN|INFO, text: ...}]
+    audit_baseline_file: "{{ audit_baseline_dir }}/fleet.yml"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Cluster and node layer (works standalone AND clustered).
+    # ------------------------------------------------------------------
+    - name: Read the cluster status (quorum and node membership)
+      community.proxmox.proxmox_cluster_status_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+      register: pve_cluster_status
+      failed_when: false     # a standalone node may answer without cluster entries
+
+    - name: Read the node status (load, memory, uptime - the /nodes view)
+      community.proxmox.proxmox_node_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+      register: pve_nodes
+
+    - name: Cluster findings (quorum first; standalone is normal here)
+      vars:
+        c_entries: "{{ pve_cluster_status.cluster_status | default([])
+                       | selectattr('type', 'equalto', 'cluster') | list }}"
+      ansible.builtin.set_fact:
+        audit_findings: >-
+          {{ audit_findings
+             + ([{'sev': 'CRITICAL',
+                  'text': 'cluster LOST quorum - nothing can manage the VMs'}]
+                if c_entries | length > 0
+                   and not (c_entries | map(attribute='quorate') | list | first | bool)
+                else [])
+             + ([{'sev': 'INFO',
+                  'text': 'standalone node: no cluster entry in /cluster/status (single-node lab; quorum treated as healthy)'}]
+                if c_entries | length == 0 else []) }}
+
+    - name: Node membership findings (the cluster's own view)
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'CRITICAL',
+              'text': 'node ' ~ (item.name | default('?')) ~ ' is OFFLINE (cluster view)'}] }}"
+      when: not (item.online | default(false) | bool)
+      loop: "{{ pve_cluster_status.cluster_status | default([])
+                | selectattr('type', 'equalto', 'node') | list }}"
+
+    - name: Node health findings (status, pressure, recent boots)
+      vars:
+        # /nodes reports cpu as a 0..1 fraction (module source verified)
+        cpu_pct: "{{ (item.cpu | default(0) | float * 100) | round(0) | int }}"
+        mem_pct: "{{ ((item.mem | default(0) | int) / (item.maxmem | default(1) | int) * 100) | round(0) | int }}"
+      ansible.builtin.set_fact:
+        audit_findings: >-
+          {{ audit_findings
+             + ([{'sev': 'CRITICAL',
+                  'text': 'node ' ~ (item.node | default('?')) ~ ' reports status ' ~ (item.status | default('?'))}]
+                if item.status | default('') != 'online' else [])
+             + ([{'sev': 'WARN',
+                  'text': 'node ' ~ item.node ~ ': memory at ' ~ mem_pct ~ '% (threshold ' ~ audit_node_mem_warn_pct ~ '%)'}]
+                if mem_pct | int >= audit_node_mem_warn_pct | int else [])
+             + ([{'sev': 'WARN',
+                  'text': 'node ' ~ item.node ~ ': CPU at ' ~ cpu_pct ~ '% (threshold ' ~ audit_node_cpu_warn_pct ~ '%)'}]
+                if cpu_pct | int >= audit_node_cpu_warn_pct | int else [])
+             + ([{'sev': 'INFO',
+                  'text': 'node ' ~ item.node ~ ' booted ~' ~ ((item.uptime | default(0) | int) // 60) ~ ' minutes ago - it rebooted since the last audit'}]
+                if item.uptime | default(0) | int > 0 and item.uptime | int < 3600 else []) }}
+      loop: "{{ pve_nodes.proxmox_nodes | default([]) }}"
+
+    # ------------------------------------------------------------------
+    # The fleet: VMs, CTs, budget (the admission gate's math, audited).
+    # ------------------------------------------------------------------
+    - name: Read the live cluster state (all qemu VMs, current config)
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        type: qemu
+        config: current
+      register: cluster_vms
+
+    - name: Read the containers (infrastructure lives in CTs)
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        type: lxc
+      register: cluster_cts
+
+    - name: Sum the allocated fleet budget (templates excluded, as in 2b)
+      ansible.builtin.set_fact:
+        allocated_vcpu: "{{ allocated_vcpu | default(0) | int
+                            + (item.config.cores | default(0) | int)
+                              * (item.config.sockets | default(1) | int) }}"
+        allocated_ram_mb: "{{ allocated_ram_mb | default(0) | int
+                              + item.config.memory | default(0) | int }}"
+      when: not item.template | default(false) | bool
+      loop: "{{ cluster_vms.proxmox_vms }}"
+
+    - name: Budget findings (manual qm set can bypass the admission gate)
+      ansible.builtin.set_fact:
+        audit_findings: >-
+          {{ audit_findings
+             + ([{'sev': 'WARN',
+                  'text': 'vCPU budget exceeded by manual change: ' ~ (allocated_vcpu | default(0) | int) ~ '/'
+                          ~ capacity_max_vcpu ~ ' allocated - new deploys will be refused at admission'}]
+                if allocated_vcpu | default(0) | int > capacity_max_vcpu | int else [])
+             + ([{'sev': 'WARN',
+                  'text': 'RAM budget exceeded by manual change: ' ~ ((allocated_ram_mb | default(0) | int) // 1024) ~ '/'
+                          ~ capacity_max_ram_gb ~ ' GB allocated - new deploys will be refused at admission'}]
+                if allocated_ram_mb | default(0) | int > capacity_max_ram_gb | int * 1024 else []) }}
+
+    - name: Infrastructure containers must be running (ctrl-01, sem-01 live here)
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'CRITICAL',
+              'text': 'container ' ~ (item.name | default('vmid-' ~ item.vmid)) ~ ' (VMID ' ~ item.vmid ~ ') is '
+                      ~ (item.status | default('unknown')) ~ ' - infrastructure DOWN'}] }}"
+      when:
+        - not item.template | default(false) | bool
+        - item.status | default('unknown') != 'running'
+      loop: "{{ cluster_cts.proxmox_vms | default([]) }}"
+
+    - name: The golden template must exist (the pipeline's single point of failure)
+      vars:
+        vm_ids: "{{ cluster_vms.proxmox_vms | default([]) | map(attribute='vmid') | map('int') | list }}"
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'WARN',
+              'text': 'golden template ' ~ proxmox_template_vmid ~ ' (' ~ proxmox_template_name ~ ') NOT FOUND - the next deploy dies at the clone'}] }}"
+      when: proxmox_template_vmid | int not in vm_ids
+
+    - name: The golden template should stay stopped
+      vars:
+        tpl_status: "{{ cluster_vms.proxmox_vms | default([])
+                        | selectattr('vmid', 'equalto', proxmox_template_vmid | int)
+                        | map(attribute='status') | list | first | default('') }}"
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'INFO',
+              'text': 'golden template ' ~ proxmox_template_name ~ ' is ' ~ tpl_status ~ ' (templates are supposed to stay stopped)'}] }}"
+      when: tpl_status not in ('', 'stopped')
+
+    # ------------------------------------------------------------------
+    # The managed fleet: the tag IS the registry. Loop+append, not a
+    # comprehension - dict literals inside Jinja comprehensions break
+    # the parser (field note, see 00's disk-records task).
+    # ------------------------------------------------------------------
+    - name: Build the managed fleet (tag pipeline-managed)
+      ansible.builtin.set_fact:
+        managed_vms: "{{ managed_vms | default([])
+           + [{'vmid': item.vmid | int,
+               'name': item.name | default('vmid-' ~ item.vmid),
+               'status': item.status | default('unknown'),
+               'cores': (item.config.cores | default(0) | int)
+                        * (item.config.sockets | default(1) | int),
+               'memory_mb': item.config.memory | default(0) | int,
+               'onboot': item.config.onboot | default(0) | int,
+               'agent': item.config.agent | default(0) | int,
+               'ip': (item.config.ipconfig0 | default('')
+                      | regex_findall('ip=([0-9.]{7,15})') | list | first | default('')),
+               'disks': item.config.keys() | select('match', '^scsi[0-9]+$') | list | length}] }}"
+      when:
+        - not item.template | default(false) | bool
+        - ((item.config.tags | default('') | string) ~ ','
+           ~ (item.tags | default('') | string)) is search('pipeline-managed')
+      loop: "{{ cluster_vms.proxmox_vms }}"
+      loop_control:
+        label: "{{ item.name | default('vmid-' ~ item.vmid) }}"
+
+    # ------------------------------------------------------------------
+    # Drift: live vs the last audit's baseline. Only the baseline can
+    # remember a DELETED VM - live state cannot. The diff lines are
+    # INFO on purpose: a change is a fact, not an emergency (the
+    # pipeline itself changes VMs on adoption re-runs).
+    # ------------------------------------------------------------------
+    - name: Does a baseline exist yet (the first run has none)
+      ansible.builtin.stat:
+        path: "{{ audit_baseline_file }}"
+      register: baseline_stat
+
+    - name: Load the last audit's baseline
+      ansible.builtin.slurp:
+        src: "{{ audit_baseline_file }}"
+      register: baseline_raw
+      when: baseline_stat.stat.exists
+
+    - name: Parse the baseline (empty-safe on first run)
+      ansible.builtin.set_fact:
+        baseline_prev: "{{ ((baseline_raw.content | b64decode | from_yaml) or {})
+                            if baseline_stat.stat.exists else {} }}"
+
+    - name: Drift report - live state vs the last audit
+      vars:
+        prev: "{{ (baseline_prev | default({}))[item.vmid | string] | default({}) }}"
+      ansible.builtin.set_fact:
+        audit_findings: >-
+          {{ audit_findings
+             + ([{'sev': 'INFO',
+                  'text': item.name ~ ': status ' ~ prev.status ~ ' -> ' ~ item.status
+                          ~ ' since the last audit'}]
+                if prev | length > 0 and item.status != prev.status else [])
+             + ([{'sev': 'INFO',
+                  'text': item.name ~ ': vCPU ' ~ (prev.cores | int) ~ ' -> ' ~ item.cores
+                          ~ ' (a deploy re-run, or a manual qm set)'}]
+                if prev | length > 0 and item.cores | int != prev.cores | int else [])
+             + ([{'sev': 'INFO',
+                  'text': item.name ~ ': RAM ' ~ (prev.memory_mb | int // 1024) ~ ' -> '
+                          ~ (item.memory_mb | int // 1024) ~ ' GB'}]
+                if prev | length > 0 and item.memory_mb | int != prev.memory_mb | int else [])
+             + ([{'sev': 'INFO',
+                  'text': item.name ~ ': IP ' ~ prev.ip ~ ' -> ' ~ item.ip}]
+                if prev | length > 0 and item.ip != prev.ip else [])
+             + ([{'sev': 'INFO',
+                  'text': item.name ~ ': disk count ' ~ (prev.disks | int) ~ ' -> ' ~ item.disks}]
+                if prev | length > 0 and item.disks | int != prev.disks | int else [])
+             + ([{'sev': 'INFO',
+                  'text': 'VMID ' ~ item.vmid ~ ' renamed: ' ~ prev.name ~ ' -> ' ~ item.name}]
+                if prev | length > 0 and item.name != prev.name else []) }}
+      loop: "{{ managed_vms | default([]) }}"
+
+    - name: Deleted managed VMs (only the baseline can remember these)
+      vars:
+        live_ids: "{{ managed_vms | default([]) | map(attribute='vmid') | map('string') | list }}"
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'CRITICAL',
+              'text': 'managed VM ' ~ (item.value.name | default('?')) ~ ' (VMID ' ~ item.key
+                      ~ ') vanished since the last audit - if this was intentional, this line disappears next run'}] }}"
+      loop: "{{ baseline_prev | default({}) | dict2items }}"
+      when: item.key not in live_ids
+
+    - name: New managed VMs (first audit - the baseline starts here)
+      vars:
+        prev_ids: "{{ baseline_prev | default({}) | dict2items | map(attribute='key') | list }}"
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'INFO',
+              'text': item.name ~ ' (VMID ' ~ item.vmid ~ ') is new since the last audit - baselined now'}] }}"
+      loop: "{{ managed_vms | default([]) }}"
+      when: item.vmid | string not in prev_ids
+
+    - name: Managed fleet API checks (stopped, onboot, agent, IP)
+      ansible.builtin.set_fact:
+        audit_findings: >-
+          {{ audit_findings
+             + ([{'sev': 'WARN',
+                  'text': item.name ~ ': STOPPED (pipeline-managed VMs are expected to run)'}]
+                if item.status != 'running' else [])
+             + ([{'sev': 'WARN',
+                  'text': item.name ~ ': onboot=0 - it will NOT come back after a host reboot'}]
+                if item.onboot | int != 1 else [])
+             + ([{'sev': 'INFO',
+                  'text': item.name ~ ': qemu-guest-agent flag off - PVE cannot see this VM IP'}]
+                if item.agent | int != 1 else [])
+             + ([{'sev': 'WARN',
+                  'text': item.name ~ ': no ipconfig0 - the SSH layer cannot reach it'}]
+                if item.ip | length == 0 else []) }}
+      loop: "{{ managed_vms | default([]) }}"
+
+    # ------------------------------------------------------------------
+    # The guest layer's door: a TCP/22 probe per running managed VM.
+    # wait_for, not ping: a pure Python socket - iputils-ping is often
+    # missing in LXC runners (same reasoning as play 00's probe).
+    # ------------------------------------------------------------------
+    - name: Probe SSH on every running managed VM
+      ansible.builtin.wait_for:
+        host: "{{ item.ip }}"
+        port: 22
+        timeout: 2
+      register: ssh_probe
+      ignore_errors: true
+      loop: "{{ managed_vms | default([])
+                | selectattr('status', 'equalto', 'running')
+                | rejectattr('ip', 'equalto', '') | list }}"
+      loop_control:
+        label: "{{ item.name }} @ {{ item.ip }}"
+
+    - name: Unreachable guests (probe failures are findings, not dead audits)
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'WARN',
+              'text': item.item.name ~ ': TCP/22 probe failed at ' ~ item.item.ip ~ ' - guest layer skipped for it'}] }}"
+      loop: "{{ ssh_probe.results | default([]) }}"
+      when: item.failed | default(false) | bool
+
+    - name: Register the reachable guests for the SSH layer
+      ansible.builtin.add_host:
+        name: "{{ item.item.name }}"
+        groups: audit_targets
+        ansible_host: "{{ item.item.ip }}"
+        ansible_user: "{{ vm_username }}"
+        ansible_ssh_private_key_file: "{{ deploy_ssh_private_key_path }}"
+      loop: "{{ ssh_probe.results | default([]) }}"
+      when: not item.failed | default(false) | bool
+
+- name: Phase 5b - play 2 - the guest view (read-only, never fatal)
+  hosts: audit_targets
+  gather_facts: true
+  ignore_unreachable: true
+
+  vars_files:
+    - vars/lab-environment.yml
+
+  tasks:
+    - name: Read the guest service states (facts, not verdicts)
+      ansible.builtin.command: systemctl is-active {{ item }}
+      loop: "{{ audit_guest_services }}"
+      register: svc_states
+      failed_when: false
+      changed_when: false
+
+    - name: Pair each service with its state
+      ansible.builtin.set_fact:
+        svc_map: "{{ svc_map | default([])
+                     + [{'svc': item.item, 'state': item.stdout | default('unknown')}] }}"
+      loop: "{{ svc_states.results | default([]) }}"
+
+    - name: Read filesystem usage (every mount; report-only)
+      ansible.builtin.shell: df -P --output=target,pcent | tail -n +2
+      register: df_out
+      changed_when: false
+      failed_when: false
+
+    - name: Collect the hot filesystems
+      vars:
+        cols: "{{ item.split() }}"
+      ansible.builtin.set_fact:
+        fs_hot: "{{ fs_hot | default([])
+                    + [{'mount': cols[0],
+                        'pct': cols[-1] | regex_replace('%', '') | int}] }}"
+      when: cols | length >= 2 and cols[-1] | regex_replace('%', '') | int >= audit_fs_warn_pct
+      loop: "{{ df_out.stdout_lines | default([]) }}"
+
+    - name: Fold this guest's findings (services down)
+      ansible.builtin.set_fact:
+        guest_findings: "{{ guest_findings | default([])
+          + [{'sev': 'WARN',
+              'text': inventory_hostname ~ ': service ' ~ item ~ ' is NOT active'}] }}"
+      loop: "{{ svc_map | default([]) | rejectattr('state', 'equalto', 'active')
+               | map(attribute='svc') | list }}"
+
+    - name: Fold this guest's findings (hot filesystems)
+      ansible.builtin.set_fact:
+        guest_findings: "{{ guest_findings | default([])
+          + [{'sev': 'WARN',
+              'text': inventory_hostname ~ ': ' ~ item.mount ~ ' at ' ~ item.pct ~ '% (threshold ' ~ audit_fs_warn_pct ~ '%)'}] }}"
+      loop: "{{ fs_hot | default([]) }}"
+
+    - name: Compose this guest's report (play 3 reads it as a host fact)
+      ansible.builtin.set_fact:
+        vm_report:
+          name: "{{ inventory_hostname }}"
+          ip: "{{ ansible_host }}"
+          uptime_s: "{{ ansible_facts['uptime_seconds'] | default(0) | int }}"
+          services_bad: "{{ svc_map | default([]) | rejectattr('state', 'equalto', 'active')
+                            | map(attribute='svc') | list }}"
+          fs_hot: "{{ fs_hot | default([]) }}"
+          findings: "{{ guest_findings | default([]) }}"
+
+- name: Phase 5b - play 3 - digest, mail, baseline, verdict
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/lab-environment.yml
+
+  vars:
+    audit_baseline_file: "{{ audit_baseline_dir }}/fleet.yml"
+
+  tasks:
+    - name: Collect the guest reports (play 2 wrote them as host facts)
+      ansible.builtin.set_fact:
+        ssh_reports: "{{ ssh_reports | default([]) + [hostvars[item].vm_report] }}"
+      loop: "{{ groups['audit_targets'] | default([]) }}"
+      when: hostvars[item].vm_report is defined
+
+    - name: Probe answered but the deploy key did not (auth failures)
+      vars:
+        reported: "{{ ssh_reports | default([]) | map(attribute='name') | list }}"
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings | default([])
+          + [{'sev': 'WARN',
+              'text': item.item.name ~ ': port 22 answers but the deploy key does not log in - SSH auth failed'}] }}"
+      loop: "{{ ssh_probe.results | default([]) }}"
+      when: not item.failed | default(false) | bool and item.item.name not in reported
+
+    - name: Normalize the audit facts (empty-safe defaults for the digest)
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings | default([]) }}"
+        managed_vms: "{{ managed_vms | default([]) }}"
+        ssh_reports: "{{ ssh_reports | default([]) }}"
+        allocated_vcpu: "{{ allocated_vcpu | default(0) | int }}"
+        allocated_ram_mb: "{{ allocated_ram_mb | default(0) | int }}"
+
+    - name: Is a mail transport installed on this runner?
+      ansible.builtin.command: which msmtp
+      register: msmtp_bin
+      failed_when: false
+      changed_when: false
+
+    - name: Mail finding (the digest still lands in this task log)
+      ansible.builtin.set_fact:
+        audit_findings: "{{ audit_findings
+          + [{'sev': 'INFO',
+              'text': 'mail not configured on the runner - digest printed to this task log only (see scripts/sem-01-msmtp.sh and semaphore/README.md)'}] }}"
+      when: >-
+        msmtp_bin.rc != 0
+        or not audit_mail_enabled | bool
+        or audit_mail_to | default('') | length == 0
+
+    - name: Compose the summary numbers the digest opens with
+      vars:
+        c_entries: "{{ pve_cluster_status.cluster_status | default([])
+                       | selectattr('type', 'equalto', 'cluster') | list }}"
+        n_all: "{{ cluster_vms.proxmox_vms | default([]) }}"
+        cts: "{{ cluster_cts.proxmox_vms | default([]) }}"
+        nonguest: "{{ n_all | rejectattr('template') | list }}"
+      ansible.builtin.set_fact:
+        audit_summary:
+          when: "{{ lookup('pipe', 'date \"+%Y-%m-%d %H:%M %Z\"') }}"
+          runner: "{{ lookup('env', 'USER') | default('unknown', true) }}@{{ lookup('pipe', 'hostname') }}"
+          worst: >-
+            {{ 'CRITICAL' if audit_findings | selectattr('sev', 'equalto', 'CRITICAL') | list | length > 0
+               else ('WARN' if audit_findings | selectattr('sev', 'equalto', 'WARN') | list | length > 0
+               else 'OK') }}
+          quorum: >-
+            {{ 'standalone' if c_entries | length == 0
+               else ('quorate' if c_entries | map(attribute='quorate') | list | first | bool
+               else 'LOST') }}
+          vm_total: "{{ nonguest | length }}"
+          vm_running: "{{ nonguest | selectattr('status', 'equalto', 'running') | list | length }}"
+          vm_stopped: "{{ nonguest | rejectattr('status', 'equalto', 'running') | list | length }}"
+          tpl_count: "{{ n_all | selectattr('template') | list | length }}"
+          ct_total: "{{ cts | rejectattr('template') | list | length }}"
+          ct_running: "{{ cts | rejectattr('template') | selectattr('status', 'equalto', 'running') | list | length }}"
+          ct_stopped: "{{ cts | rejectattr('template') | rejectattr('status', 'equalto', 'running') | list | length }}"
+          alloc_vcpu: "{{ allocated_vcpu }}"
+          cap_vcpu: "{{ capacity_max_vcpu }}"
+          alloc_ram_gb: "{{ allocated_ram_mb | int // 1024 }}"
+          cap_ram_gb: "{{ capacity_max_ram_gb }}"
+          info_count: "{{ audit_findings | selectattr('sev', 'equalto', 'INFO') | list | length }}"
+          warn_count: "{{ audit_findings | selectattr('sev', 'equalto', 'WARN') | list | length }}"
+          crit_count: "{{ audit_findings | selectattr('sev', 'equalto', 'CRITICAL') | list | length }}"
+
+    - name: Render the digest (headers included - msmtp -t reads them)
+      ansible.builtin.template:
+        src: templates/audit-mail.j2
+        dest: /tmp/proxmox-audit-digest.txt
+        mode: "0644"
+
+    - name: Print the digest to the task log (mail-independent by design)
+      ansible.builtin.debug:
+        msg: "{{ lookup('file', '/tmp/proxmox-audit-digest.txt') }}"
+
+    - name: Mail the digest (msmtp reads the envelope from the message)
+      ansible.builtin.shell: cat /tmp/proxmox-audit-digest.txt | msmtp -t
+      when: >-
+        msmtp_bin.rc == 0
+        and audit_mail_enabled | bool
+        and audit_mail_to | default('') | length > 0
+      changed_when: false
+
+    # The baseline refresh comes AFTER the diff used it: this run
+    # compared against the previous snapshot, the next run compares
+    # against this one. Stale entries (deleted VMs) drop out naturally
+    # because the snapshot is a full rewrite from live managed state.
+    - name: Build the fleet snapshot for the next audit
+      ansible.builtin.set_fact:
+        baseline_next: "{{ baseline_next | default({})
+           | combine({item.vmid | string: {'name': item.name, 'status': item.status,
+                                           'cores': item.cores, 'memory_mb': item.memory_mb,
+                                           'ip': item.ip, 'disks': item.disks}}) }}"
+      loop: "{{ managed_vms | default([]) }}"
+
+    - name: Ensure the baseline directory exists
+      ansible.builtin.file:
+        path: "{{ audit_baseline_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write the refreshed baseline
+      ansible.builtin.copy:
+        content: "{{ baseline_next | default({}) | to_nice_yaml }}"
+        dest: "{{ audit_baseline_file }}"
+        mode: "0644"
+
+    - name: Verdict - red means "a human should read the digest"
+      vars:
+        hot: "{{ audit_findings | selectattr('sev', 'in', ['CRITICAL', 'WARN']) | list }}"
+      ansible.builtin.assert:
+        that: hot | length == 0
+        success_msg: >-
+          AUDIT OK: {{ audit_summary.info_count }} info note(s), digest
+          {{ 'mailed to ' ~ audit_mail_to if msmtp_bin.rc == 0 and audit_mail_enabled | bool
+             and audit_mail_to | default('') | length > 0 else 'printed above' }}.
+          Baseline refreshed for the next run.
+        fail_msg: >-
+          AUDIT {{ audit_summary.worst }}: {{ hot | length }} finding(s) need a human:
+          {% for f in hot %}{{ f.sev }}: {{ f.text }}{% if not loop.last %} | {% endif %}{% endfor %}
+          Full digest above (and in the mail, if configured).

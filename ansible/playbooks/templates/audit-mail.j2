@@ -1,0 +1,47 @@
+To: {{ audit_mail_to }}
+From: {{ audit_mail_from }}
+Subject: [proxmox-audit] {{ audit_summary.worst }} - {{ audit_summary.vm_total }} VM(s), {{ audit_summary.ct_total }} CT(s) - {{ audit_summary.when }}
+
+PROXMOX HEALTH AUDIT - {{ audit_summary.when }}
+Runner:   {{ audit_summary.runner }}
+Verdict:  {{ audit_summary.worst }} ({{ audit_summary.crit_count }} critical / {{ audit_summary.warn_count }} warn / {{ audit_summary.info_count }} info)
+
+CLUSTER
+  quorum:    {{ audit_summary.quorum }}
+  nodes:     {{ pve_nodes.proxmox_nodes | default([]) | map(attribute='node') | join(', ') }}
+
+NODES
+{% for n in pve_nodes.proxmox_nodes | default([]) %}
+  {{ '%-20s' % (n.node | default('?')) }} status={{ n.status | default('?') }} cpu={{ ((n.cpu | default(0) | float * 100) | round(0) | int) }}% mem={{ (((n.mem | default(0) | int) / (n.maxmem | default(1) | int) * 100) | round(0) | int) }}% up={{ (n.uptime | default(0) | int) // 3600 }}h
+{% else %}
+  (no node data)
+{% endfor %}
+
+FLEET
+  qemu VMs:     {{ audit_summary.vm_running }} running / {{ audit_summary.vm_stopped }} stopped / {{ audit_summary.vm_total }} total (+{{ audit_summary.tpl_count }} template(s))
+  containers:   {{ audit_summary.ct_running }} running / {{ audit_summary.ct_stopped }} stopped / {{ audit_summary.ct_total }} total
+  allocated:    {{ audit_summary.alloc_vcpu }}/{{ audit_summary.cap_vcpu }} vCPU, {{ audit_summary.alloc_ram_gb }}/{{ audit_summary.cap_ram_gb }} GB (templates and CTs excluded)
+
+MANAGED FLEET (tag: pipeline-managed)
+{% for vm in managed_vms %}
+  {{ '%-24s' % vm.name }} VMID {{ '%-5s' % vm.vmid }} {{ '%-8s' % vm.status }} {{ vm.cores }} vCPU / {{ vm.memory_mb | int // 1024 }} GB  ip={{ vm.ip | default('none') }}  disks={{ vm.disks }}
+{% else %}
+  (none - no VM carries the pipeline-managed tag yet)
+{% endfor %}
+
+GUESTS (SSH layer, read-only)
+{% for rep in ssh_reports %}
+  {{ '%-24s' % rep.name }} up {{ rep.uptime_s | int // 3600 }}h  services: {{ 'all active' if rep.services_bad | length == 0 else rep.services_bad | join(', ') ~ ' NOT active' }}{% if rep.fs_hot | length > 0 %}  fs: {{ rep.fs_hot | map(attribute='mount') | join(', ') }} hot{% endif %}
+{% else %}
+  (no guest reached over SSH)
+{% endfor %}
+
+FINDINGS
+{% for f in audit_findings %}
+  [{{ f.sev }}] {{ f.text }}
+{% else %}
+  (none - a quiet fleet)
+{% endfor %}
+
+Baseline: {{ audit_baseline_file }} (refreshed by this run - the next audit diffs against it)
+Schedule: see semaphore/README.md (the morning/evening task schedule lives in Semaphore)

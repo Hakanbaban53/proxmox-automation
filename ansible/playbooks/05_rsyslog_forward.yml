@@ -25,8 +25,11 @@
 #   receiver answers, spilling to /var/spool/rsyslog when it does not
 # - saveOnShutdown=on survives an agent restart with the queue intact
 # - resumeRetryCount=-1 retries forever instead of disabling the rule
-# The knob values live in group_vars (host, port, protocol, queue
-# size), so lab and production differ by variables, never by structure.
+# The knob values live in playbooks/vars/agent-layer.yml (host, port,
+# protocol, queue size), loaded via vars_files - one source of truth
+# for static CLI runs AND deploy runs through Semaphore's inventory
+# (field finding #18). Lab and production differ by values, never by
+# structure.
 #
 # Lab plumbing choices, honestly: the receiver port defaults to 5514,
 # not 514, so the lab stub needs no privileged port and no root daemon
@@ -50,8 +53,10 @@
 # changed in edition 2.
 #
 # Idempotency: spool mode, template and restart converge on the first
-# run (field-run shape, guide chapter 5, 28 Aug 2026: ok=13 changed=3,
-# re-run ok=12 changed=0). Every run ends with the same smoke test: a tagged
+# run (field-run shape, guide chapter 5: standalone 28 Aug 2026
+# ok=13 changed=3, re-run ok=12 changed=0; first pipeline run 29 Aug
+# 2026, run #37: the same three changes folded into changed=11). Every
+# run ends with the same smoke test: a tagged
 # message through logger, then found in the LOCAL log (proving rsyslog
 # processed it) - the receiver-side line is the field receipt.
 - name: Logging - forward everything to the central receiver (QRadar pattern)

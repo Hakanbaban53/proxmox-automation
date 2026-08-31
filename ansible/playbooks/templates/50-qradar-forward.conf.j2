@@ -4,7 +4,7 @@
 # the receiver is down, messages spill to /var/spool/rsyslog instead of
 # vanishing. Lab values: ctrl-01, port 5514 (unprivileged, so the socat
 # stub needs no root); production QRadar: port 514. Structure never
-# changes between the two, only the group_vars values do.
+# changes between the two, only the variable values do (vars/agent-layer.yml).
 action(type="omfwd"
        target="{{ rsyslog_receiver_host }}"
        port="{{ rsyslog_receiver_port }}"

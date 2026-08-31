@@ -72,6 +72,13 @@ apt-get update -qq
 apt-get install -y -qq git curl ansible \
   python3-proxmoxer python3-requests python3-jmespath python3-netaddr \
   openssh-client locales
+# community.proxmox 2.0.0's cluster/node info modules require
+# proxmoxer >= 2.3, but Ubuntu 26.04's python3-proxmoxer is 2.2.0
+# (field-found: the first Health Audit run died at "Read the node
+# status" with "Requires proxmoxer 2.3 or newer"). The pip copy
+# lands in /usr/local and shadows the apt one - pure-Python library,
+# no daemon. PEP 668 blocks plain pip on 26.04, hence the flag.
+pip3 install -qq --break-system-packages 'proxmoxer==2.3.0'
 # make the commonly inherited en_US.UTF-8 valid for future sessions
 # too (idempotent; a no-op once generated):
 locale-gen en_US.UTF-8
@@ -168,13 +175,22 @@ fi
 echo "    public key (authorize this on the git host, ctrl-01):"
 sudo -u "$SEM_USER" cat "$SEM_HOME/.ssh/id_ed25519.pub" | sed 's/^/      /'
 
-echo ">>> [8/8] Ansible collections (as the service user)"
-# env LANG/LC_ALL: belt and suspenders for the locale finding above -
-# an explicit valid locale survives any sudo environment policy, so
-# the install cannot fail on an inherited LANG again.
-sudo -u "$SEM_USER" env HOME="$SEM_HOME" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-  ansible-galaxy collection install \
-  community.proxmox community.general ansible.posix
+echo ">>> [8/8] Ansible collections (system path, as root)"
+# Install to /usr/share/ansible/collections - the HOME-independent
+# system search path - so the collection resolves no matter which
+# user/HOME combination runs ansible-playbook (the service user's
+# passwd home is /home/semaphore; a user-path install is invisible
+# to the task if it lands anywhere else). The first lab install
+# went to ~/.ansible instead, and when that galaxy step silently
+# failed, Ubuntu's deb-bundled community.proxmox 1.4.0
+# (dist-packages) kept serving the old modules: Deploy VM stayed
+# green while the first Health Audit died at module resolution
+# (field-found, 30 Aug 2026; see README troubleshooting).
+# community.proxmox is PINNED to 2.0.0: the playbooks are validated
+# against that exact version.
+ansible-galaxy collection install \
+  -p /usr/share/ansible/collections \
+  community.proxmox:2.0.0 community.general ansible.posix
 
 echo
 echo "==============================================================="

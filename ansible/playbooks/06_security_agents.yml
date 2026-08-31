@@ -27,7 +27,9 @@
 # saying where the real one goes; the marker block is production code
 # and does not change when the payload does.
 #
-# Idempotency arithmetic (guide chapter 5 has the expected shapes):
+# Idempotency arithmetic (guide chapter 5 has the field transcripts,
+# proven twice over: standalone 28 Aug 2026 and pipeline 29 Aug 2026,
+# run #37):
 #   first run  - dirs + scripts + installer runs   -> changed=3
 #   re-run     - installer skipped by the marker   -> changed=0
 #   version
@@ -123,8 +125,8 @@
         fail_msg: >-
           Marker mismatch for {{ item.name }}: expected agent/version
           {{ item.version }}/mode {{ item.mode }}. If you just bumped
-          the version in group_vars, this failure is the drift alarm
-          doing its job - force a reinstall with:
+          the version in vars/agent-layer.yml, this failure is the
+          drift alarm doing its job - force a reinstall with:
           ansible provisioned -m file -a "path={{ item.install_dir }}/.installed state=absent" -b
           then re-run this playbook.
       loop: "{{ security_agents }}"

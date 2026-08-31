@@ -5,6 +5,8 @@
 #   0. validates the request (profile, hostname, IP, custom specs)
 #   1. resolves the profile into vCPU / RAM / data-disk list
 #   2. checks whether a VM with that hostname already exists
+#   2b. ADMISSION CONTROL (Phase 5a): IP collision, liveness probe,
+#      capacity budget - refuses the request BEFORE the clone
 #   3. CLONES the golden template (vmid 9000) with a full copy on nfs-shared
 #   4. APPLIES the spec to the clone: CPU, RAM, net0 (+VLAN tag), the
 #      cloud-init drive (ide2), ipconfig0, ssh keys, DNS, agent, onboot
@@ -183,6 +185,124 @@
                               if existing_vms.proxmox_vms | length > 0 else '' }}"
 
     # ------------------------------------------------------------------
+    # 2b. Admission control (Phase 5a). The enum asserts above are
+    #     per-request sanity; THIS is the fleet gate. Three questions,
+    #     all answered from LIVE cluster state - deliberately no
+    #     registry: the API is the truth (a registry would only add a
+    #     second thing that can drift). The intent record arrives with
+    #     5b's drift audit, where it has a job.
+    #       a. does another VM already own the requested IP (ipconfig0)?
+    #       b. is something ALIVE at that IP even without an ipconfig0
+    #          record (manual VM, DHCP VM, an LXC, anything with sshd)?
+    #       c. would this VM exceed the admission budget (allocated
+    #          vCPU/RAM across all non-template qemu VMs)?
+    #     A refusal is cheap: it happens BEFORE the clone, so a rejected
+    #     request leaves nothing behind (no half-built VM to clean up).
+    #     Same defense-in-depth pattern as the enums: the form is UX,
+    #     the API caller and -e bypass it, the playbook is the gate.
+    # ------------------------------------------------------------------
+    - name: Read the live cluster state (all qemu VMs, current config)
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port | int }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        type: qemu
+        config: current
+      register: cluster_vms
+
+    - name: Collect the static IP records (ipconfig0 of every VM)
+      # ipconfig0 is the only interface this pipeline configures, so it is
+      # the only place a pipeline-style collision can hide. DHCP/manual
+      # machines are invisible here - that is exactly what the liveness
+      # probe below is for. Loop+append, not a comprehension: dict/list
+      # literals inside a Jinja comprehension break the parser (see the
+      # disk-records task above for the field note).
+      ansible.builtin.set_fact:
+        ip_records: >-
+          {{ ip_records | default([])
+             + [{'ip': (item.config.ipconfig0 | default('')
+                        | regex_findall('ip=([0-9.]{7,15})'))[0],
+                 'vmid': item.vmid | int,
+                 'name': item.name | default('vmid-' ~ item.vmid)}] }}
+      when: (item.config.ipconfig0 | default('')
+             | regex_findall('ip=([0-9.]{7,15})')) | length > 0
+      loop: "{{ cluster_vms.proxmox_vms }}"
+      loop_control:
+        label: "{{ item.name | default('vmid-' ~ item.vmid) }}"
+
+    - name: Sum allocated vCPU and RAM (templates and the target excluded)
+      # ALLOCATED, not used: config.memory/cores is what PVE owes the VM
+      # whether it runs or not (cluster resources read maxmem=0 for a
+      # STOPPED VM - not usable for budgeting; verified against
+      # community.proxmox 2.0.0 + PVE 9.2 API behavior). The TARGET's
+      # current allocation is excluded so an adoption re-run never
+      # counts the same VM twice; the requested spec takes its place in
+      # the sum. Templates and CTs are infrastructure, not fleet budget
+      # (type: qemu never returns LXC; template flag filters the rest).
+      ansible.builtin.set_fact:
+        allocated_vcpu: "{{ allocated_vcpu | default(0) | int
+                            + (item.config.cores | default(0) | int)
+                              * (item.config.sockets | default(1) | int) }}"
+        allocated_ram_mb: "{{ allocated_ram_mb | default(0) | int
+                              + item.config.memory | default(0) | int }}"
+      when:
+        - not item.template | default(false) | bool
+        - item.vmid | int != target_vmid | int
+      loop: "{{ cluster_vms.proxmox_vms }}"
+      loop_control:
+        label: "{{ item.name | default('vmid-' ~ item.vmid) }}"
+
+    - name: Probe the requested IP (anything listening on SSH?)
+      # wait_for, not ping: a pure Python socket - iputils-ping is often
+      # missing in LXC runners, and port 22 is what the pipeline actually
+      # needs reachable anyway. A refused/filtered port FAILS the probe;
+      # for a fresh IP that failure is the good outcome. 2 s covers a
+      # silently-dropping firewall; a NAT bridge refuses instantly.
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip }}"
+        port: 22
+        timeout: 2
+      register: ip_probe
+      ignore_errors: true
+
+    - name: Admission control - refuse before the clone spends anything
+      vars:
+        ip_collision: >-
+          {{ ip_records | default([])
+             | selectattr('ip', 'equalto', vm_ip)
+             | rejectattr('vmid', 'equalto', target_vmid | int) | list }}
+        ip_owned_by_target: >-
+          {{ ip_records | default([])
+             | selectattr('ip', 'equalto', vm_ip)
+             | selectattr('vmid', 'equalto', target_vmid | int)
+             | list | length > 0 }}
+      ansible.builtin.assert:
+        that:
+          - ip_collision | length == 0
+          - ip_probe.failed | default(false) | bool or ip_owned_by_target | bool
+          - allocated_vcpu | int + spec_vcpu | int <= capacity_max_vcpu | int
+          - allocated_ram_mb | int + spec_ram_gb | int * 1024 <= capacity_max_ram_gb | int * 1024
+        success_msg: >-
+          Admission granted: {{ vm_ip }} is free (or ours), fleet after
+          this VM {{ allocated_vcpu | int + spec_vcpu | int }}/{{ capacity_max_vcpu }}
+          vCPU, {{ (allocated_ram_mb | int + spec_ram_gb | int * 1024) // 1024 }}/{{ capacity_max_ram_gb }} GB.
+        fail_msg: >-
+          Admission refused (nothing was created): {{ vm_ip }} -
+          {% if ip_collision | length > 0 %}already assigned to VMID
+          {{ ip_collision[0].vmid }} ({{ ip_collision[0].name }});
+          pick another IP or retire that VM first{% elif not (ip_probe.failed | default(false) | bool) %}something
+          is ALIVE there (TCP/22 answered) but no VM holds it in ipconfig0
+          - a manual or DHCP machine squats that address; pick another IP{% else %}budget
+          exceeded: adding {{ spec_vcpu }} vCPU / {{ spec_ram_gb }} GB would take the
+          fleet to {{ allocated_vcpu | int + spec_vcpu | int }}/{{ capacity_max_vcpu }} vCPU and
+          {{ (allocated_ram_mb | int + spec_ram_gb | int * 1024) // 1024 }}/{{ capacity_max_ram_gb }} GB
+          allocated; lower the request or decommission a VM (see
+          vars/lab-environment.yml capacity_max_*){% endif %}.
+
+    # ------------------------------------------------------------------
     # 3. Clone - specs travel in the NEXT task, not this one.
     # ------------------------------------------------------------------
     - name: Clone the golden template (full copy on nfs-shared)
@@ -329,4 +449,7 @@
           {{ final_data_disks | map(attribute='serial') | list | join(',') }},
           ip {{ vm_ip }}/{{ vm_ip_cidr }}
           {{ '(tag ' ~ vm_vlan ~ ')' if vm_vlan | int > 0 else '(untagged)' }}.
+          Fleet after admission: {{ allocated_vcpu | int + spec_vcpu | int }}/{{ capacity_max_vcpu }}
+          vCPU, {{ (allocated_ram_mb | int + spec_ram_gb | int * 1024) // 1024 }}/{{ capacity_max_ram_gb }}
+          GB allocated (templates and CTs excluded).
           Provisioning took over where Terraform left; agents are next.
